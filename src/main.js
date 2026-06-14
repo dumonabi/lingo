@@ -19,6 +19,7 @@ const state = {
   audioChunks: [],
   mediaStream: null,
   currentAudio: null,
+  recordingStartedAt: 0,
 };
 
 let picker1;
@@ -30,6 +31,13 @@ const conversationEl = $('#conversation');
 const toastEl = $('#toast');
 const mainMicBtn = $('#main-mic');
 const liveTranscript = $('#live-transcript');
+const progressWrap = $('#progress-wrap');
+const progressTrack = $('#progress-track');
+const progressFill = $('#progress-fill');
+
+let progressRaf = null;
+let progressStartedAt = 0;
+let progressEstimateMs = 4000;
 
 function findLang(code) {
   return state.languages.find((l) => l.code === code);
@@ -267,6 +275,70 @@ function getMimeType() {
   return types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
 }
 
+function estimateProcessingMs(recordingMs, blobBytes) {
+  const MIN_MS = 3000;
+  const MAX_MS = 6500;
+
+  const audioSeconds = Math.max(recordingMs / 1000, blobBytes / 11000, 0.5);
+
+  // Real waits cluster around 3–6s; longer clips add a little, not linearly
+  const t = Math.min(audioSeconds / 10, 1);
+  return Math.round(MIN_MS + t * (MAX_MS - MIN_MS));
+}
+
+function simulatedProgress(elapsedMs) {
+  const target = progressEstimateMs;
+  const ratio = elapsedMs / target;
+
+  if (ratio <= 1) return ratio * 97;
+
+  // Past estimate: creep slowly so the bar never looks frozen
+  const overtime = elapsedMs - target;
+  return Math.min(97 + (overtime / (target * 0.6)) * 2, 99);
+}
+
+function updateProgressBar(pct) {
+  const value = Math.round(pct);
+  progressFill.style.width = `${pct}%`;
+  progressTrack.setAttribute('aria-valuenow', String(value));
+}
+
+function startProgress(estimatedMs) {
+  stopProgress();
+  progressEstimateMs = estimatedMs;
+  progressStartedAt = performance.now();
+  progressWrap.hidden = false;
+  progressWrap.classList.add('is-active');
+  updateProgressBar(0);
+
+  const tick = (now) => {
+    const elapsed = now - progressStartedAt;
+    updateProgressBar(simulatedProgress(elapsed));
+    progressRaf = requestAnimationFrame(tick);
+  };
+
+  progressRaf = requestAnimationFrame(tick);
+}
+
+function finishProgress() {
+  return new Promise((resolve) => {
+    stopProgress();
+    progressWrap.classList.remove('is-active');
+    updateProgressBar(100);
+    setTimeout(() => {
+      progressWrap.hidden = true;
+      updateProgressBar(0);
+      resolve();
+    }, 220);
+  });
+}
+
+function stopProgress() {
+  if (progressRaf) cancelAnimationFrame(progressRaf);
+  progressRaf = null;
+  progressWrap.classList.remove('is-active');
+}
+
 async function toggleRecording() {
   if (!languagesReady()) {
     showToast('Select two languages');
@@ -296,6 +368,7 @@ async function startRecording() {
     };
 
     state.mediaRecorder.start();
+    state.recordingStartedAt = Date.now();
     state.isRecording = true;
     mainMicBtn.classList.add('recording');
     liveTranscript.hidden = false;
@@ -335,6 +408,9 @@ async function stopRecording() {
     return;
   }
 
+  const recordingMs = state.recordingStartedAt ? Date.now() - state.recordingStartedAt : 0;
+  startProgress(estimateProcessingMs(recordingMs, blob.size));
+
   try {
     const form = new FormData();
     form.append('audio', blob, `audio.${mimeType.includes('mp4') ? 'mp4' : 'webm'}`);
@@ -370,6 +446,7 @@ async function stopRecording() {
     state.messages.push(message);
     renderMessage(message);
     prefetchAudio(message);
+    await finishProgress();
   } catch (err) {
     showToast(err.message);
   } finally {
@@ -388,10 +465,13 @@ function releaseMic() {
 }
 
 function resetMicUI() {
+  stopProgress();
   state.isProcessing = false;
   mainMicBtn.classList.remove('processing');
   liveTranscript.hidden = true;
   liveTranscript.textContent = '';
+  progressWrap.hidden = true;
+  updateProgressBar(0);
   updateMicState();
 }
 
