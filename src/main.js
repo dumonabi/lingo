@@ -82,6 +82,7 @@ async function init() {
   await loadLanguages();
   initPickers();
   bindEvents();
+  bindMicHelp();
   checkMicSupport();
   warmMic();
   updateMicState();
@@ -185,8 +186,7 @@ function initPickers() {
         state.lang2 = other?.code || DEFAULT_LANG2;
         picker2.setValue(state.lang2);
       }
-      saveLanguages();
-      updateMicState();
+      onLanguagesChanged();
     },
   });
 
@@ -201,8 +201,7 @@ function initPickers() {
         state.lang1 = other?.code || DEFAULT_LANG1;
         picker1.setValue(state.lang1);
       }
-      saveLanguages();
-      updateMicState();
+      onLanguagesChanged();
     },
   });
 }
@@ -217,6 +216,116 @@ function loadSavedLanguages() {
 
 function saveLanguages() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({ lang1: state.lang1, lang2: state.lang2 }));
+}
+
+function clearConversation() {
+  state.messages = [];
+  conversationEl.innerHTML = '';
+}
+
+function onLanguagesChanged() {
+  clearConversation();
+  saveLanguages();
+  updateMicState();
+}
+
+function getMicHelp(err) {
+  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const isAndroid = /Android/i.test(navigator.userAgent);
+  const denied = err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError';
+  const notFound = err?.name === 'NotFoundError' || err?.name === 'DevicesNotFoundError';
+
+  if (denied) {
+    if (isIOS) {
+      return {
+        title: 'Allow microphone on iPhone',
+        intro: 'Chrome needs permission to use your microphone.',
+        steps: [
+          'Open the iPhone Settings app',
+          'Scroll down and tap Chrome',
+          'Turn Microphone ON',
+          'Come back here, tap Try again, and tap Allow when asked',
+        ],
+      };
+    }
+    if (isAndroid) {
+      return {
+        title: 'Allow microphone in Chrome',
+        intro: 'Chrome needs permission to use your microphone.',
+        steps: [
+          'Tap the lock icon next to the website address',
+          'Tap Permissions → Microphone → Allow',
+          'If you do not see it: Chrome menu (⋮) → Settings → Site settings → Microphone → allow this site',
+          'Tap Try again below',
+        ],
+      };
+    }
+    return {
+      title: 'Allow microphone access',
+      intro: 'Your browser blocked microphone access for this site.',
+      steps: [
+        'Click the lock or tune icon in the address bar',
+        'Set Microphone to Allow',
+        'Reload the page if needed, then tap Try again',
+      ],
+    };
+  }
+
+  if (notFound) {
+    return {
+      title: 'Microphone not found',
+      intro: 'No microphone was detected, or access is still blocked.',
+      steps: isIOS
+        ? [
+            'Check Settings → Chrome → Microphone is ON',
+            'Disconnect Bluetooth headphones if they have no mic',
+            'Close other apps using the microphone',
+            'Reload this page and tap Try again',
+          ]
+        : [
+            'Check that a microphone is connected and not muted',
+            'In Chrome, allow microphone access for this site (lock icon in the address bar)',
+            'On Android: Settings → Apps → Chrome → Permissions → Microphone',
+            'Reload this page and tap Try again',
+          ],
+    };
+  }
+
+  return {
+    title: 'Could not access microphone',
+    intro: 'Something stopped the microphone from starting.',
+    steps: [
+      'Check microphone permissions for this site in your browser settings',
+      'Close other apps that may be using the microphone',
+      'Reload the page and tap Try again',
+    ],
+  };
+}
+
+function showMicHelp(err) {
+  const help = getMicHelp(err);
+  $('#mic-help-title').textContent = help.title;
+  $('#mic-help-intro').textContent = help.intro;
+  $('#mic-help-steps').innerHTML = help.steps.map((step) => `<li>${step}</li>`).join('');
+  $('#mic-help').hidden = false;
+}
+
+function hideMicHelp() {
+  $('#mic-help').hidden = true;
+}
+
+function bindMicHelp() {
+  $('#mic-help-close').addEventListener('click', hideMicHelp);
+  $('#mic-help-retry').addEventListener('click', async () => {
+    hideMicHelp();
+    releaseMic();
+    try {
+      await ensureMicStream();
+      showToast('Microphone ready — tap to speak');
+    } catch (err) {
+      showMicHelp(err);
+    }
+  });
 }
 
 function languagesReady() {
@@ -374,7 +483,7 @@ async function startRecording() {
     liveTranscript.hidden = false;
     liveTranscript.textContent = 'Listening…';
   } catch (err) {
-    showToast(err.name === 'NotAllowedError' ? 'Microphone permission denied' : 'Could not access microphone');
+    showMicHelp(err);
     releaseMic();
   }
 }
@@ -417,11 +526,14 @@ async function stopRecording() {
     form.append('lang1', state.lang1);
     form.append('lang2', state.lang2);
     form.append('context', JSON.stringify(
-      state.messages.slice(-2).map((m) => ({
-        detectedLanguage: m.detectedLanguage,
-        original: m.original,
-        translated: m.translated,
-      }))
+      state.messages
+        .filter((m) => [state.lang1, state.lang2].includes(m.detectedLanguage))
+        .slice(-2)
+        .map((m) => ({
+          detectedLanguage: m.detectedLanguage,
+          original: m.original,
+          translated: m.translated,
+        }))
     ));
 
     const res = await apiFetch('/api/converse', { method: 'POST', body: form }).catch(() => {

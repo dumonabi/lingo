@@ -50,6 +50,8 @@ For every message:
 4. Stay coherent with recent messages (names, pronouns, references).
 5. Do NOT end sourceText or translatedText with a period or dot — these are chat messages meant to be copied and sent as-is.
 
+IMPORTANT: The ONLY languages in this conversation are ${name1} (${lang1}) and ${name2} (${lang2}). Never translate into English or any other language unless it is exactly ${lang1} or ${lang2}. When targetLanguage is "${lang2}", translatedText must be in ${name2}; when targetLanguage is "${lang1}", translatedText must be in ${name1}.
+
 IMPORTANT: detectedLanguage and targetLanguage must be exactly "${lang1}" or "${lang2}" (lowercase codes only).
 
 Respond with JSON only:
@@ -127,14 +129,18 @@ function stripTrailingPeriod(text) {
 }
 
 async function translateText(openai, text, lang1, lang2, context) {
+  const name1 = LANGUAGE_NAMES[lang1] || lang1;
+  const name2 = LANGUAGE_NAMES[lang2] || lang2;
+
   const recentContext = context
+    .filter((m) => [lang1, lang2].includes(m.detectedLanguage))
     .slice(-2)
     .map((m) => `${m.detectedLanguage}: ${m.original} → ${m.translated}`)
     .join('\n');
 
   const userMessage = recentContext
-    ? `Recent conversation:\n${recentContext}\n\nNew message:\n${text.trim()}`
-    : text.trim();
+    ? `Language pair: ${name1} (${lang1}) ↔ ${name2} (${lang2}) only.\n\nRecent conversation:\n${recentContext}\n\nNew message:\n${text.trim()}`
+    : `Language pair: ${name1} (${lang1}) ↔ ${name2} (${lang2}) only.\n\nNew message:\n${text.trim()}`;
 
   const completion = await withRetry(() =>
     openai.chat.completions.create({
@@ -223,8 +229,8 @@ export function createApp() {
     const openai = requireOpenAI(res);
     if (!openai) return;
 
-    const lang1 = req.body.lang1;
-    const lang2 = req.body.lang2;
+    const lang1 = String(req.body.lang1 || '').toLowerCase().trim();
+    const lang2 = String(req.body.lang2 || '').toLowerCase().trim();
     let context = [];
 
     try {
@@ -235,6 +241,9 @@ export function createApp() {
 
     if (!lang1 || !lang2 || lang1 === lang2) {
       return res.status(400).json({ error: 'Select two different languages' });
+    }
+    if (!LANGUAGE_NAMES[lang1] || !LANGUAGE_NAMES[lang2]) {
+      return res.status(400).json({ error: 'Invalid language selection' });
     }
     if (!req.file?.buffer?.length) {
       return res.status(400).json({ error: 'No audio received' });
