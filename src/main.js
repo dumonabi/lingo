@@ -37,8 +37,6 @@ let picker2;
 const $ = (sel) => document.querySelector(sel);
 
 const currentMessageEl = $('#current-message');
-const historyZoneEl = $('#history-zone');
-const historyListEl = $('#message-history');
 const toastEl = $('#toast');
 const mainMicBtn = $('#main-mic');
 const liveTranscript = $('#live-transcript');
@@ -69,10 +67,11 @@ let micWaveBarEls = [];
 let micWaveScrollEl = null;
 let micWaveLastShift = 0;
 let micWaveShiftBusy = false;
-let selectedHistoryId = null;
 
 const COPY_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>';
+const SHARE_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z"/></svg>';
 const LISTEN_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>';
+const shareSupported = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
 
 function prefetchAudio(msg) {
   return loadMessageAudio(msg);
@@ -217,6 +216,30 @@ function resetListenBtn(btn) {
   btn.classList.remove('playing');
   btn.disabled = false;
   delete btn.dataset.busy;
+  releaseActionButtonFocus(btn);
+}
+
+function releaseActionButtonFocus(btn) {
+  btn?.blur();
+  if (document.activeElement instanceof HTMLElement && document.activeElement !== document.body) {
+    document.activeElement.blur();
+  }
+}
+
+async function shareTranslation(text, btn) {
+  if (!shareSupported) {
+    showToast('Share not available on this device');
+    return;
+  }
+
+  try {
+    await navigator.share({ text });
+  } catch (err) {
+    if (err?.name === 'AbortError') return;
+    showToast('Could not share');
+  } finally {
+    releaseActionButtonFocus(btn);
+  }
 }
 
 async function init() {
@@ -372,25 +395,7 @@ function saveLanguages() {
 
 function clearConversation() {
   state.messages = [];
-  selectedHistoryId = null;
   currentMessageEl.innerHTML = '<p class="message-empty">Your last translation will appear here</p>';
-  historyListEl.innerHTML = '';
-  historyZoneEl.hidden = true;
-}
-
-function refreshHistorySelection() {
-  historyListEl.querySelectorAll('.message-card-history').forEach((card) => {
-    card.classList.toggle('message-selected', Number(card.dataset.messageId) === selectedHistoryId);
-  });
-}
-
-function onHistoryListClick(e) {
-  const card = e.target.closest('.message-card-history');
-  if (!card || e.target.closest('.icon-btn')) return;
-
-  const id = Number(card.dataset.messageId);
-  selectedHistoryId = selectedHistoryId === id ? null : id;
-  refreshHistorySelection();
 }
 
 function onLanguagesChanged() {
@@ -1363,6 +1368,8 @@ function resetMicUI() {
 
 async function playTranslation(msg, btn) {
   if (btn.dataset.busy === '1') return;
+
+  releaseActionButtonFocus(btn.closest('.message-card')?.querySelector('.copy-btn, .share-btn'));
   btn.dataset.busy = '1';
 
   if (state.currentAudio) {
@@ -1393,93 +1400,69 @@ async function playTranslation(msg, btn) {
   }
 }
 
-function createMessageCard(msg, { prominent = false } = {}) {
+function createMessageCard(msg) {
   const el = document.createElement('article');
-  el.className = prominent ? 'message-card message-card-current' : 'message-card message-card-history';
+  el.className = 'message-card message-card-current';
   el.dataset.messageId = String(msg.id);
 
-  if (prominent) {
-    el.innerHTML = `
-      <div class="message-bubble">
-        <div class="message-original">${escapeHtml(msg.original)}</div>
-        <div class="message-translated">
-          <span class="message-translated-text">${escapeHtml(msg.translated)}</span>
+  el.innerHTML = `
+    <div class="message-bubble">
+      <div class="message-original">${escapeHtml(msg.original)}</div>
+      <div class="message-translated">
+        <span class="message-translated-text">${escapeHtml(msg.translated)}</span>
+        <div class="message-inline-actions">
           <button type="button" class="icon-btn copy-btn copy-btn-inline" title="Copy" aria-label="Copy">
             ${COPY_BTN_SVG}
           </button>
+          ${shareSupported ? `
+          <button type="button" class="icon-btn share-btn share-btn-inline" title="Share" aria-label="Share">
+            ${SHARE_BTN_SVG}
+          </button>` : ''}
         </div>
       </div>
-      <div class="message-meta">
-        <div class="message-actions-listen">
-          <button type="button" class="icon-btn listen-btn" title="Listen" aria-label="Listen">
-            ${LISTEN_BTN_SVG}
-          </button>
-        </div>
+    </div>
+    <div class="message-meta">
+      <div class="message-actions-listen">
+        <button type="button" class="icon-btn listen-btn" title="Listen" aria-label="Listen">
+          ${LISTEN_BTN_SVG}
+        </button>
       </div>
-    `;
-  } else {
-    el.innerHTML = `
-      <div class="message-bubble">
-        <div class="message-original">${escapeHtml(msg.original)}</div>
-        <div class="message-translated">
-          <span class="message-translated-text">${escapeHtml(msg.translated)}</span>
-          <div class="message-inline-actions">
-            <button type="button" class="icon-btn listen-btn listen-btn-inline" title="Listen" aria-label="Listen">
-              ${LISTEN_BTN_SVG}
-            </button>
-            <button type="button" class="icon-btn copy-btn copy-btn-inline" title="Copy" aria-label="Copy">
-              ${COPY_BTN_SVG}
-            </button>
-          </div>
-        </div>
-      </div>
-    `;
-    el.tabIndex = 0;
-    el.addEventListener('focus', () => {
-      selectedHistoryId = msg.id;
-      refreshHistorySelection();
-    });
-  }
+    </div>
+  `;
 
   const listenBtn = el.querySelector('.listen-btn');
+  const copyBtn = el.querySelector('.copy-btn');
   listenBtn.addEventListener('click', () => playTranslation(msg, listenBtn));
 
-  el.querySelector('.copy-btn').addEventListener('click', async () => {
-    await navigator.clipboard.writeText(msg.translated);
-    showToast('Copied!');
+  copyBtn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(msg.translated);
+      showToast('Copied!');
+    } catch {
+      showToast('Could not copy');
+    } finally {
+      releaseActionButtonFocus(copyBtn);
+    }
   });
+
+  const shareBtn = el.querySelector('.share-btn');
+  if (shareBtn) {
+    shareBtn.addEventListener('click', () => shareTranslation(msg.translated, shareBtn));
+  }
 
   return el;
 }
 
 function renderConversation() {
   currentMessageEl.innerHTML = '';
-  historyListEl.innerHTML = '';
 
   if (!state.messages.length) {
     currentMessageEl.innerHTML = '<p class="message-empty">Your last translation will appear here</p>';
-    historyZoneEl.hidden = true;
     return;
   }
 
   const latest = state.messages[state.messages.length - 1];
-  const history = state.messages.slice(0, -1);
-
-  currentMessageEl.appendChild(createMessageCard(latest, { prominent: true }));
-
-  if (history.length) {
-    const historyIds = new Set(history.map((item) => item.id));
-    if (!historyIds.has(selectedHistoryId)) selectedHistoryId = null;
-
-    history.forEach((msg) => {
-      historyListEl.appendChild(createMessageCard(msg));
-    });
-    historyZoneEl.hidden = false;
-    refreshHistorySelection();
-  } else {
-    selectedHistoryId = null;
-    historyZoneEl.hidden = true;
-  }
+  currentMessageEl.appendChild(createMessageCard(latest));
 }
 
 function showToast(message) {
@@ -1497,7 +1480,6 @@ function escapeHtml(str) {
 
 function bindEvents() {
   mainMicBtn.addEventListener('click', toggleRecording);
-  historyListEl.addEventListener('click', onHistoryListClick);
   window.addEventListener('lingo:unauthorized', () => {
     if (authRequired) showAuthGate();
   });
