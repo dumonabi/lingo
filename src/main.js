@@ -74,7 +74,7 @@ const LISTEN_BTN_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3
 const shareSupported = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
 
 function prefetchAudio(msg) {
-  return loadMessageAudio(msg);
+  return loadMessageAudio(msg, { prefetch: true });
 }
 
 function audioCacheKey(msg) {
@@ -98,7 +98,7 @@ function withTimeout(promise, ms, message) {
   ]);
 }
 
-async function loadMessageAudio(msg, { retry = false } = {}) {
+async function loadMessageAudio(msg, { retry = false, prefetch = false } = {}) {
   const key = audioCacheKey(msg);
   if (msg._audioKey && msg._audioKey !== key) {
     invalidateMessageAudio(msg);
@@ -109,18 +109,22 @@ async function loadMessageAudio(msg, { retry = false } = {}) {
 
   if (msg._audioPromise && !retry) {
     try {
-      await withTimeout(msg._audioPromise, 25000, 'Audio timed out — tap Listen again');
+      await withTimeout(msg._audioPromise, 30000, 'Audio timed out — tap Listen again');
     } catch {
       invalidateMessageAudio(msg);
     }
     if (msg.audioUrl) return;
   }
 
-  msg._audioPromise = apiFetch('/api/speak', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: msg.translated, lang: msg.targetLanguage }),
-  }).then(async (res) => {
+  const attempts = prefetch ? 3 : 2;
+
+  const fetchOnce = async () => {
+    const res = await apiFetch('/api/speak', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: msg.translated, lang: msg.targetLanguage }),
+    });
+
     let errMsg = 'Audio not ready — tap Listen again';
     if (!res.ok) {
       try {
@@ -131,14 +135,37 @@ async function loadMessageAudio(msg, { retry = false } = {}) {
       }
       throw new Error(errMsg);
     }
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('audio')) {
+      throw new Error('Audio not ready — tap Listen again');
+    }
+
     msg.audioUrl = URL.createObjectURL(await res.blob());
-  });
+  };
+
+  msg._audioPromise = (async () => {
+    let lastError;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        await fetchOnce();
+        return;
+      } catch (err) {
+        lastError = err;
+        invalidateMessageAudio(msg);
+        if (attempt < attempts) {
+          await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+        }
+      }
+    }
+    throw lastError;
+  })();
 
   try {
-    await withTimeout(msg._audioPromise, 25000, 'Audio timed out — tap Listen again');
+    await withTimeout(msg._audioPromise, 35000, 'Audio timed out — tap Listen again');
   } catch (err) {
     invalidateMessageAudio(msg);
-    throw err;
+    if (!prefetch) throw err;
   }
 }
 
@@ -171,6 +198,7 @@ function playAudioUrl(url) {
   return new Promise((resolve, reject) => {
     const audio = new Audio(url);
     audio.volume = 1;
+    audio.preload = 'auto';
     state.currentAudio = audio;
     const boost = attachPlaybackBoost(audio);
     let settled = false;
@@ -199,8 +227,26 @@ function playAudioUrl(url) {
 
     const start = async () => {
       try {
-        if (boost?.ctx.state === 'suspended') {
-          await boost.ctx.resume();
+        const ctx = boost?.ctx || getPlaybackContext();
+        if (ctx?.state === 'suspended') {
+          await ctx.resume();
+        }
+        if (audio.readyState < 2) {
+          await new Promise((res, rej) => {
+            const onReady = () => {
+              audio.removeEventListener('canplaythrough', onReady);
+              audio.removeEventListener('error', onErr);
+              res();
+            };
+            const onErr = () => {
+              audio.removeEventListener('canplaythrough', onReady);
+              audio.removeEventListener('error', onErr);
+              rej(new Error('Playback failed'));
+            };
+            audio.addEventListener('canplaythrough', onReady, { once: true });
+            audio.addEventListener('error', onErr, { once: true });
+            audio.load();
+          });
         }
         await audio.play();
       } catch (err) {
@@ -1381,17 +1427,20 @@ async function playTranslation(msg, btn) {
   btn.disabled = true;
 
   try {
-    if (!msg.audioUrl) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        await loadMessageAudio(msg);
-      } catch {
-        await loadMessageAudio(msg, { retry: true });
+        if (!msg.audioUrl) {
+          await loadMessageAudio(msg, { retry: attempt > 1 });
+        }
+        if (!msg.audioUrl) throw new Error('Audio not ready — tap Listen again');
+        await playAudioUrl(msg.audioUrl);
+        return;
+      } catch (err) {
+        invalidateMessageAudio(msg);
+        if (attempt === 2) throw err;
+        await sleep(400);
       }
     }
-
-    if (!msg.audioUrl) throw new Error('Audio not ready — tap Listen again');
-
-    await playAudioUrl(msg.audioUrl);
   } catch (err) {
     invalidateMessageAudio(msg);
     showToast(err.message);

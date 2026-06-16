@@ -48,7 +48,7 @@ function buildSystemPrompt(lang1, lang2) {
 For every message:
 1. Detect which language it is in (${lang1} or ${lang2}) — the speaker never tells you.
 2. sourceText: rewrite what they said in the SAME language — natural, simple, casual, like real speech. Gently fix grammar, spelling, and awkward phrasing. Keep the meaning and friendly tone. Use conversation context when provided.
-3. translatedText: translate to the OTHER language — equally natural, simple, and casual. Not formal, not robotic, not word-for-word stiff. How people actually talk.
+3. translatedText: translate to the OTHER language — equally natural, simple, and casual. Not formal, not robotic, not word-for-word stiff. How people actually talk. Use only the target language — no English words mixed into Spanish (or vice versa) unless they are universal loanwords like "OK".
 4. Stay coherent with recent messages (names, pronouns, references).
 5. Do NOT end sourceText or translatedText with a period or dot — these are chat messages meant to be copied and sent as-is.
 
@@ -147,6 +147,35 @@ const LATIN_LANGS = new Set([
   'pl', 'cs', 'sk', 'ro', 'hu', 'tr', 'vi', 'id', 'ms', 'tl', 'sw', 'af',
 ]);
 
+const LATIN_MARKER_PATTERNS = {
+  es: /\b(el|la|los|las|de|que|y|en|un|una|es|por|con|no|se|lo|le|su|para|muy|pero|bien|hola|gracias|qué|cómo|está|también|ahora|solo|puedo|quiero|tengo|hay|esto|eso|aquí|donde|cuando|porque|algo|nada|más|muy|bueno|vale|claro)\b/gi,
+  en: /\b(the|and|is|are|was|were|you|your|have|has|this|that|with|for|not|but|what|how|hello|thanks|please|can|will|just|from|they|been|would|could|about|into|there|their|when|where|because|something|nothing|more|very|good|okay|right)\b/gi,
+  pt: /\b(o|a|os|as|de|que|e|em|um|uma|não|se|lo|la|por|com|para|muito|mas|bem|olá|obrigad|está|também|agora|só|posso|quero|tenho|há|isto|isso|aqui)\b/gi,
+  fr: /\b(le|la|les|de|que|et|en|un|une|est|pas|se|pour|avec|dans|sur|très|mais|bien|bonjour|merci|comment|aussi|maintenant|je|tu|il|elle|nous|vous|ils|elles|ce|ça|ici)\b/gi,
+};
+
+const HD_TTS_LANGS = new Set([
+  'th', 'ar', 'he', 'zh', 'ja', 'ko', 'hi', 'ta', 'te', 'bn', 'km', 'lo', 'my', 'pa', 'ur', 'fa', 'ru', 'uk', 'el', 'ka', 'am', 'ne', 'si', 'ml', 'kn', 'gu', 'mr', 'bo',
+]);
+
+function scoreLatinLanguage(text, code) {
+  if (!text || !LATIN_MARKER_PATTERNS[code]) return 0;
+  const lower = text.toLowerCase();
+  let score = (lower.match(LATIN_MARKER_PATTERNS[code]) || []).length;
+  if (code === 'es') score += (lower.match(/[ñáéíóúü¿¡]/g) || []).length * 2;
+  if (code === 'pt') score += (lower.match(/[ãõçáéíóú]/g) || []).length * 1.5;
+  if (code === 'fr') score += (lower.match(/[àâçéèêëîïôùûü]/g) || []).length * 1.5;
+  return score;
+}
+
+function likelyLatinLanguage(text, lang1, lang2) {
+  if (!LATIN_LANGS.has(lang1) || !LATIN_LANGS.has(lang2)) return null;
+  const s1 = scoreLatinLanguage(text, lang1);
+  const s2 = scoreLatinLanguage(text, lang2);
+  if (s1 === s2) return null;
+  return s1 > s2 ? lang1 : lang2;
+}
+
 function hintMatchesLang(hint, code) {
   if (hint === 'unknown') return null;
   if (hint === 'thai') return code === 'th';
@@ -155,11 +184,21 @@ function hintMatchesLang(hint, code) {
   if (hint === 'ko') return code === 'ko';
   if (hint === 'cyrillic') return ['ru', 'uk', 'bg', 'sr', 'mk'].includes(code);
   if (hint === 'arabic') return ['ar', 'fa', 'ur', 'he'].includes(code);
-  if (hint === 'latin') return LATIN_LANGS.has(code);
+  if (hint === 'latin') return null;
   return null;
 }
 
 function alignTranslationFields(sourceText, translatedText, detected, target) {
+  const sourceLikely = likelyLatinLanguage(sourceText, detected, target);
+  const translatedLikely = likelyLatinLanguage(translatedText, detected, target);
+
+  if (sourceLikely === target && translatedLikely === detected) {
+    return { sourceText: translatedText, translatedText: sourceText };
+  }
+  if (sourceLikely === detected && translatedLikely === target) {
+    return { sourceText: sourceText, translatedText: translatedText };
+  }
+
   let source = sourceText;
   let translated = translatedText;
   const sourceHint = textScriptHint(source);
@@ -189,6 +228,8 @@ function inferDetectedFromText(text, lang1, lang2) {
   const hint = textScriptHint(text);
   if (hintMatchesLang(hint, lang1) === true) return lang1;
   if (hintMatchesLang(hint, lang2) === true) return lang2;
+  const likely = likelyLatinLanguage(text, lang1, lang2);
+  if (likely) return likely;
   return null;
 }
 
@@ -254,16 +295,40 @@ async function transcribeAudio(openai, file) {
   }
 }
 
-async function generateSpeech(openai, text) {
+async function generateSpeech(openai, text, lang) {
+  const input = prepareTextForSpeech(text, lang);
+  if (!input) {
+    throw new Error('No speakable text');
+  }
+
+  const model = lang && HD_TTS_LANGS.has(lang) ? 'tts-1-hd' : 'tts-1';
   const speech = await withRetry(() =>
     openai.audio.speech.create({
-      model: 'tts-1',
+      model,
       voice: 'nova',
-      input: text.trim(),
-      speed: 1.05,
-    })
+      input,
+      speed: lang === 'th' ? 0.98 : 1.05,
+      response_format: 'mp3',
+    }),
+    4
   );
   return Buffer.from(await speech.arrayBuffer());
+}
+
+function prepareTextForSpeech(text, lang) {
+  if (!text || typeof text !== 'string') return '';
+  let cleaned = text
+    .trim()
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[…]/g, '...')
+    .replace(/\s+/g, ' ');
+
+  // Strip stray Latin words from Thai/CJK output when TTS would mispronounce them.
+  if (lang && !LATIN_LANGS.has(lang)) {
+    cleaned = cleaned.replace(/\b[a-zA-Z]{2,}\b/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  return cleaned;
 }
 
 export function createApp() {
@@ -355,13 +420,15 @@ export function createApp() {
     const openai = requireOpenAI(res);
     if (!openai) return;
 
-    const { text } = req.body;
+    const { text, lang } = req.body;
     if (!text?.trim()) {
       return res.status(400).json({ error: 'Text is required' });
     }
 
+    const langCode = lang ? String(lang).toLowerCase().trim() : null;
+
     try {
-      const buffer = await generateSpeech(openai, text);
+      const buffer = await generateSpeech(openai, text, langCode);
       res.set('Content-Type', 'audio/mpeg');
       res.set('Cache-Control', 'private, max-age=3600');
       res.send(buffer);
