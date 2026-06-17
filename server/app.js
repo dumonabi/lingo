@@ -317,18 +317,11 @@ async function generateSpeech(openai, text, lang) {
 
 function prepareTextForSpeech(text, lang) {
   if (!text || typeof text !== 'string') return '';
-  let cleaned = text
+  return text
     .trim()
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
     .replace(/[…]/g, '...')
     .replace(/\s+/g, ' ');
-
-  // Strip stray Latin words from Thai/CJK output when TTS would mispronounce them.
-  if (lang && !LATIN_LANGS.has(lang)) {
-    cleaned = cleaned.replace(/\b[a-zA-Z]{2,}\b/g, '').replace(/\s+/g, ' ').trim();
-  }
-
-  return cleaned;
 }
 
 export function createApp() {

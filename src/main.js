@@ -29,7 +29,11 @@ const state = {
   mediaStream: null,
   currentAudio: null,
   recordingStartedAt: 0,
+  latestMessageId: null,
 };
+
+let playbackEpoch = 0;
+let speakChain = Promise.resolve();
 
 let picker1;
 let picker2;
@@ -81,12 +85,52 @@ function audioCacheKey(msg) {
   return `${msg.translated}|${msg.targetLanguage}`;
 }
 
+function cancelMessageAudio(msg) {
+  if (msg._speakAbort) {
+    msg._speakAbort.abort();
+    msg._speakAbort = null;
+  }
+  invalidateMessageAudio(msg);
+}
+
 function invalidateMessageAudio(msg) {
   if (msg.audioUrl) {
     URL.revokeObjectURL(msg.audioUrl);
     msg.audioUrl = null;
   }
   msg._audioPromise = null;
+}
+
+function stopPlayback() {
+  playbackEpoch++;
+  const audio = state.currentAudio;
+  if (audio) {
+    audio.onended = null;
+    audio.onerror = null;
+    audio.pause();
+    try {
+      audio.currentTime = 0;
+    } catch {
+      // ignore seek errors
+    }
+    audio.removeAttribute('src');
+    audio.load();
+    state.currentAudio = null;
+  }
+}
+
+function prepareForNewTranslation(message) {
+  stopPlayback();
+  state.latestMessageId = message.id;
+  for (const m of state.messages) {
+    if (m.id !== message.id) cancelMessageAudio(m);
+  }
+}
+
+function enqueueSpeak(task) {
+  const run = speakChain.then(task, task);
+  speakChain = run.catch(() => {});
+  return run;
 }
 
 function withTimeout(promise, ms, message) {
@@ -98,122 +142,155 @@ function withTimeout(promise, ms, message) {
   ]);
 }
 
-async function loadMessageAudio(msg, { retry = false, prefetch = false } = {}) {
+async function loadMessageAudio(msg, { prefetch = false } = {}) {
   const key = audioCacheKey(msg);
   if (msg._audioKey && msg._audioKey !== key) {
-    invalidateMessageAudio(msg);
+    cancelMessageAudio(msg);
   }
   msg._audioKey = key;
 
   if (msg.audioUrl) return;
 
-  if (msg._audioPromise && !retry) {
+  if (msg._audioPromise) {
     try {
-      await withTimeout(msg._audioPromise, 30000, 'Audio timed out — tap Listen again');
+      await msg._audioPromise;
     } catch {
-      invalidateMessageAudio(msg);
+      // handled below
     }
     if (msg.audioUrl) return;
   }
 
   const attempts = prefetch ? 3 : 2;
+  const messageId = msg.id;
+  const generation = playbackEpoch;
 
-  const fetchOnce = async () => {
-    const res = await apiFetch('/api/speak', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: msg.translated, lang: msg.targetLanguage }),
-    });
+  msg._audioPromise = enqueueSpeak(async () => {
+    if (prefetch && state.latestMessageId && messageId !== state.latestMessageId) return;
 
-    let errMsg = 'Audio not ready — tap Listen again';
-    if (!res.ok) {
-      try {
-        const data = await res.json();
-        errMsg = data.error || errMsg;
-      } catch {
-        if (res.status === 429) errMsg = 'Too many audio requests — wait a moment';
-      }
-      throw new Error(errMsg);
+    if (msg._speakAbort) {
+      msg._speakAbort.abort();
+      msg._speakAbort = null;
     }
+    const controller = new AbortController();
+    msg._speakAbort = controller;
 
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('audio')) {
-      throw new Error('Audio not ready — tap Listen again');
-    }
-
-    msg.audioUrl = URL.createObjectURL(await res.blob());
-  };
-
-  msg._audioPromise = (async () => {
     let lastError;
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (prefetch && state.latestMessageId && messageId !== state.latestMessageId) return;
+
       try {
-        await fetchOnce();
+        const res = await apiFetch('/api/speak', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: msg.translated, lang: msg.targetLanguage }),
+          signal: controller.signal,
+        });
+
+        let errMsg = 'Audio not ready — tap Listen again';
+        if (!res.ok) {
+          try {
+            const data = await res.json();
+            errMsg = data.error || errMsg;
+          } catch {
+            if (res.status === 429) errMsg = 'Too many audio requests — wait a moment';
+          }
+          throw new Error(errMsg);
+        }
+
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('audio')) {
+          throw new Error('Audio not ready — tap Listen again');
+        }
+
+        const blob = await res.blob();
+        if (!blob.size) throw new Error('Audio not ready — tap Listen again');
+        if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+        msg.audioUrl = URL.createObjectURL(blob);
+        msg._speakAbort = null;
         return;
       } catch (err) {
+        if (err?.name === 'AbortError') throw err;
         lastError = err;
         invalidateMessageAudio(msg);
         if (attempt < attempts) {
-          await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+          await new Promise((resolve) => setTimeout(resolve, 450 * attempt));
         }
       }
     }
-    throw lastError;
-  })();
+
+    msg._speakAbort = null;
+    throw lastError || new Error('Audio not ready — tap Listen again');
+  });
 
   try {
-    await withTimeout(msg._audioPromise, 35000, 'Audio timed out — tap Listen again');
+    await withTimeout(msg._audioPromise, 40000, 'Audio timed out — tap Listen again');
   } catch (err) {
-    invalidateMessageAudio(msg);
-    if (!prefetch) throw err;
+    if (err?.name !== 'AbortError') {
+      invalidateMessageAudio(msg);
+      if (!prefetch) throw err;
+    }
+  } finally {
+    if (generation !== playbackEpoch && prefetch) {
+      cancelMessageAudio(msg);
+    }
   }
 }
 
-let playbackContext = null;
-
-function getPlaybackContext() {
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  if (!Ctx) return null;
-  if (!playbackContext) playbackContext = new Ctx();
-  return playbackContext;
-}
-
-function attachPlaybackBoost(audio) {
-  const ctx = getPlaybackContext();
-  if (!ctx) return null;
-
-  try {
-    const source = ctx.createMediaElementSource(audio);
-    const gain = ctx.createGain();
-    gain.gain.value = 1.6;
-    source.connect(gain);
-    gain.connect(ctx.destination);
-    return { ctx, source, gain };
-  } catch {
-    return null;
+function waitForAudioReady(audio, ms = 4000) {
+  if (audio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    return Promise.resolve();
   }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    const onReady = () => {
+      cleanup();
+      resolve();
+    };
+
+    const onErr = () => {
+      cleanup();
+      reject(new Error('Playback failed'));
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      audio.removeEventListener('loadeddata', onReady);
+      audio.removeEventListener('canplay', onReady);
+      audio.removeEventListener('error', onErr);
+    };
+
+    audio.addEventListener('loadeddata', onReady, { once: true });
+    audio.addEventListener('canplay', onReady, { once: true });
+    audio.addEventListener('error', onErr, { once: true });
+  });
 }
 
 function playAudioUrl(url) {
-  return new Promise((resolve, reject) => {
-    const audio = new Audio(url);
-    audio.volume = 1;
-    audio.preload = 'auto';
-    state.currentAudio = audio;
-    const boost = attachPlaybackBoost(audio);
-    let settled = false;
+  const epoch = playbackEpoch;
 
+  return new Promise((resolve, reject) => {
+    const audio = new Audio();
+    audio.preload = 'auto';
+    audio.playsInline = true;
+    audio.setAttribute('playsinline', '');
+    audio.volume = 1;
+    state.currentAudio = audio;
+
+    let settled = false;
     const finish = (fn) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try {
-        boost?.source?.disconnect();
-        boost?.gain?.disconnect();
-      } catch {
-        // ignore disconnect errors
-      }
-      state.currentAudio = null;
+      audio.onended = null;
+      audio.onerror = null;
+      if (state.currentAudio === audio) state.currentAudio = null;
       fn();
     };
 
@@ -222,32 +299,20 @@ function playAudioUrl(url) {
       finish(() => reject(new Error('Playback timed out — tap again')));
     }, 90000);
 
-    audio.onended = () => finish(resolve);
+    audio.onended = () => {
+      if (epoch !== playbackEpoch) {
+        finish(() => reject(new DOMException('Aborted', 'AbortError')));
+        return;
+      }
+      finish(resolve);
+    };
     audio.onerror = () => finish(() => reject(new Error('Playback failed')));
 
     const start = async () => {
       try {
-        const ctx = boost?.ctx || getPlaybackContext();
-        if (ctx?.state === 'suspended') {
-          await ctx.resume();
-        }
-        if (audio.readyState < 2) {
-          await new Promise((res, rej) => {
-            const onReady = () => {
-              audio.removeEventListener('canplaythrough', onReady);
-              audio.removeEventListener('error', onErr);
-              res();
-            };
-            const onErr = () => {
-              audio.removeEventListener('canplaythrough', onReady);
-              audio.removeEventListener('error', onErr);
-              rej(new Error('Playback failed'));
-            };
-            audio.addEventListener('canplaythrough', onReady, { once: true });
-            audio.addEventListener('error', onErr, { once: true });
-            audio.load();
-          });
-        }
+        audio.src = url;
+        await waitForAudioReady(audio);
+        if (epoch !== playbackEpoch) return;
         await audio.play();
       } catch (err) {
         finish(() => reject(err));
@@ -1033,6 +1098,7 @@ function applyTranslationResult(data) {
   };
 
   state.messages.push(message);
+  prepareForNewTranslation(message);
   renderConversation();
   prefetchAudio(message).catch(() => {});
 }
@@ -1292,6 +1358,7 @@ async function toggleRecording() {
 }
 
 async function startRecording() {
+  stopPlayback();
   try {
     await ensureMicStream();
     await prepareMicMeter(state.mediaStream);
@@ -1394,6 +1461,7 @@ function cleanupRecorder() {
 }
 
 function releaseMic() {
+  stopPlayback();
   state.mediaStream?.getTracks().forEach((t) => t.stop());
   state.mediaStream = null;
   state.mediaRecorder = null;
@@ -1417,33 +1485,22 @@ async function playTranslation(msg, btn) {
 
   releaseActionButtonFocus(btn.closest('.message-card')?.querySelector('.copy-btn, .share-btn'));
   btn.dataset.busy = '1';
-
-  if (state.currentAudio) {
-    state.currentAudio.pause();
-    state.currentAudio = null;
-  }
+  stopPlayback();
 
   btn.classList.add('playing');
   btn.disabled = true;
 
   try {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        if (!msg.audioUrl) {
-          await loadMessageAudio(msg, { retry: attempt > 1 });
-        }
-        if (!msg.audioUrl) throw new Error('Audio not ready — tap Listen again');
-        await playAudioUrl(msg.audioUrl);
-        return;
-      } catch (err) {
-        invalidateMessageAudio(msg);
-        if (attempt === 2) throw err;
-        await sleep(400);
-      }
+    if (!msg.audioUrl) {
+      await loadMessageAudio(msg);
     }
+    if (!msg.audioUrl) throw new Error('Audio not ready — tap Listen again');
+    await playAudioUrl(msg.audioUrl);
   } catch (err) {
-    invalidateMessageAudio(msg);
-    showToast(err.message);
+    if (err?.name !== 'AbortError') {
+      cancelMessageAudio(msg);
+      showToast(err.message);
+    }
   } finally {
     resetListenBtn(btn);
   }
