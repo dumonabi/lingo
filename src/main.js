@@ -13,7 +13,7 @@ import {
 const STORAGE_KEY = 'lingo-languages';
 const DEFAULT_LANG1 = 'en';
 const DEFAULT_LANG2 = 'es';
-const MAX_RECORDING_MS = 60_000;
+const MAX_RECORDING_MS = 90_000;
 const RECORDING_TAIL_MS = 400;
 
 let authRequired = false;
@@ -731,12 +731,12 @@ function getMimeType() {
 }
 
 function estimateProcessingMs(recordingMs, blobBytes) {
-  const MIN_MS = 2000;
-  const MAX_MS = 4500;
+  const MIN_MS = 2500;
+  const MAX_MS = 7500;
 
   const audioSeconds = Math.max(recordingMs / 1000, blobBytes / 11000, 0.5);
 
-  const t = Math.min(audioSeconds / 10, 1);
+  const t = Math.min(audioSeconds / 20, 1);
   return Math.round(MIN_MS + t * (MAX_MS - MIN_MS));
 }
 
@@ -1115,7 +1115,7 @@ function buildConversationContext() {
 
 function applyTranslationResult(data) {
   const message = {
-    id: Date.now(),
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     original: data.sourceText || data.rawText,
     translated: data.translatedText,
     detectedLanguage: data.detectedLanguage,
@@ -1133,15 +1133,16 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchConverse(form, { attempts = 3 } = {}) {
+async function fetchConverse(formFactory, { attempts = 3 } = {}) {
   let lastError;
   let lastRes;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
+      const body = typeof formFactory === 'function' ? formFactory() : formFactory;
       const res = await withTimeout(
-        apiFetch('/api/converse', { method: 'POST', body: form }),
-        90000,
+        apiFetch('/api/converse', { method: 'POST', body }),
+        120000,
         'Request timed out — message saved',
       );
       lastRes = res;
@@ -1191,16 +1192,19 @@ async function submitRecording({ blob, mimeType, recordingMs, lang1, lang2, cont
     });
   }
 
-  const form = new FormData();
-  form.append('audio', blob, `audio.${mimeType.includes('mp4') ? 'mp4' : 'webm'}`);
-  form.append('lang1', lang1);
-  form.append('lang2', lang2);
-  form.append('durationMs', String(safeRecordingMs));
-  form.append('context', JSON.stringify(context));
+  const buildForm = () => {
+    const form = new FormData();
+    form.append('audio', blob, `audio.${mimeType.includes('mp4') ? 'mp4' : 'webm'}`);
+    form.append('lang1', lang1);
+    form.append('lang2', lang2);
+    form.append('durationMs', String(safeRecordingMs));
+    form.append('context', JSON.stringify(context));
+    return form;
+  };
 
   let res;
   try {
-    res = await fetchConverse(form, { attempts: pendingId ? 2 : 3 });
+    res = await fetchConverse(buildForm, { attempts: pendingId ? 2 : 3 });
   } catch (err) {
     const current = (await listPendingRecordings()).find((item) => item.id === id);
     await updatePendingRecording(id, {
@@ -1402,17 +1406,56 @@ async function startRecording() {
   }
 }
 
+async function waitForRecorderStop(mediaRecorder) {
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      setTimeout(resolve, 400);
+    };
+
+    const timeout = setTimeout(finish, 5000);
+
+    mediaRecorder.onstop = finish;
+
+    try {
+      if (mediaRecorder.state === 'recording' && typeof mediaRecorder.requestData === 'function') {
+        mediaRecorder.requestData();
+      }
+      mediaRecorder.stop();
+    } catch {
+      finish();
+    }
+  });
+}
+
+function buildRecordingBlob(mimeType) {
+  return new Blob(state.audioChunks, { type: mimeType });
+}
+
 async function stopRecording({ autoLimit = false } = {}) {
-  if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') return;
   if (state.stoppingRecording) return;
+  if (!state.isRecording && !state.mediaRecorder && !state.audioChunks.length) return;
+
   state.stoppingRecording = true;
+  let retryPendingAfterStop = false;
 
   try {
-    if (!autoLimit) {
+    if (!autoLimit && state.isRecording) {
       await sleep(RECORDING_TAIL_MS);
     }
 
-    if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') {
+    const mimeType = state.mediaRecorder?.mimeType || 'audio/webm';
+    const recorder = state.mediaRecorder;
+    const hasActiveRecorder = recorder && recorder.state !== 'inactive';
+    const hasCapturedAudio = state.audioChunks.length > 0
+      && (state.recordingStartedAt ? Date.now() - state.recordingStartedAt > 300 : true);
+
+    if (!hasActiveRecorder && !hasCapturedAudio) {
       state.isRecording = false;
       resetMicUI();
       return;
@@ -1427,21 +1470,20 @@ async function stopRecording({ autoLimit = false } = {}) {
     liveTranscript.hidden = true;
     stopRecordingProgress();
 
-    const mimeType = state.mediaRecorder.mimeType || 'audio/webm';
+    if (hasActiveRecorder) {
+      await waitForRecorderStop(recorder);
+      cleanupRecorder();
+    } else {
+      cleanupRecorder();
+    }
 
-    await new Promise((resolve) => {
-      state.mediaRecorder.onstop = () => {
-        setTimeout(resolve, 200);
-      };
-      if (state.mediaRecorder.state === 'recording' && typeof state.mediaRecorder.requestData === 'function') {
-        state.mediaRecorder.requestData();
-      }
-      state.mediaRecorder.stop();
-    });
+    let blob = buildRecordingBlob(mimeType);
+    if (blob.size < 400) {
+      await sleep(300);
+      blob = buildRecordingBlob(mimeType);
+    }
 
-    cleanupRecorder();
-
-    const blob = new Blob(state.audioChunks, { type: mimeType });
+    const chunks = state.audioChunks;
     state.audioChunks = [];
 
     const elapsedMs = state.recordingStartedAt ? Date.now() - state.recordingStartedAt : 0;
@@ -1450,6 +1492,7 @@ async function stopRecording({ autoLimit = false } = {}) {
       : clampRecordingMs(elapsedMs);
 
     if (!autoLimit && recordingMs < 450 && blob.size < 800) {
+      state.audioChunks = chunks;
       showToast('Recording too short');
       resetMicUI();
       return;
@@ -1468,10 +1511,13 @@ async function stopRecording({ autoLimit = false } = {}) {
       await finishProgress();
     } catch (err) {
       if (err.retryable !== false) {
-        schedulePendingRetry(3000);
+        retryPendingAfterStop = true;
       }
     } finally {
       resetMicUI();
+      if (retryPendingAfterStop) {
+        wakePendingQueue();
+      }
     }
   } finally {
     state.stoppingRecording = false;
