@@ -142,7 +142,7 @@ function revealListenButton(message) {
   const listenWrap = getMessageCardEl(message)?.querySelector('.message-actions-listen');
   if (!listenWrap) return;
   listenWrap.hidden = false;
-  listenWrap.classList.add('is-ready');
+  listenWrap.querySelector('.listen-btn')?.classList.add('is-ready');
 }
 
 function startBackgroundAudio(message) {
@@ -2612,20 +2612,20 @@ function createMessageCard(msg) {
         <button type="button" class="icon-btn share-btn share-btn-inline" title="Share" aria-label="Share">
           ${SHARE_BTN_SVG}
         </button>
+        <div class="message-actions-listen"${msg.audioUrl ? '' : ' hidden'}>
+          <button type="button" class="icon-btn listen-btn listen-btn-inline" title="Listen" aria-label="Listen">
+            ${LISTEN_BTN_SVG}
+          </button>
+        </div>
         <button type="button" class="icon-btn copy-btn copy-btn-inline" title="Copy" aria-label="Copy">
           ${COPY_BTN_SVG}
         </button>
       </div>
     </div>
-    <div class="message-actions-listen"${msg.audioUrl ? '' : ' hidden'}>
-      <button type="button" class="icon-btn listen-btn" title="Listen" aria-label="Listen">
-        ${LISTEN_BTN_SVG}
-      </button>
-    </div>
   `;
 
   if (msg.audioUrl) {
-    el.querySelector('.message-actions-listen')?.classList.add('is-ready');
+    el.querySelector('.listen-btn')?.classList.add('is-ready');
   }
 
   const listenBtn = el.querySelector('.listen-btn');

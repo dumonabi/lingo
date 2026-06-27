@@ -708,26 +708,42 @@ body {
 }
 
 .message-footer-actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
   margin-top: 0.85rem;
   padding-top: 0.65rem;
   border-top: 1px solid var(--border);
 }
 
+.share-btn-inline {
+  justify-self: start;
+  grid-column: 1;
+}
+
 .message-actions-listen {
+  grid-column: 2;
+  justify-self: center;
   display: flex;
   justify-content: center;
-  width: 100%;
+}
+
+.copy-btn-inline {
+  justify-self: end;
+  grid-column: 3;
 }
 
 .message-actions-listen[hidden] {
   display: none;
 }
 
-.message-actions-listen.is-ready {
-  animation: fadeInUp 0.35s ease;
+.listen-btn.is-ready {
+  animation: listenBtnReveal 0.35s ease;
+}
+
+@keyframes listenBtnReveal {
+  from { opacity: 0; transform: scale(0.92); }
+  to { opacity: 1; transform: scale(1); }
 }
 
 .icon-btn {
@@ -757,7 +773,7 @@ body {
   outline-offset: 2px;
 }
 
-.listen-btn {
+.listen-btn:not(.listen-btn-inline) {
   min-width: 56px;
   min-height: 56px;
   padding: 0.7rem;
@@ -767,7 +783,7 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.3);
 }
 
-.message-card-current .listen-btn {
+.message-card-current .listen-btn:not(.listen-btn-inline) {
   min-width: 60px;
   min-height: 60px;
   padding: 0.75rem;
@@ -781,16 +797,18 @@ body {
   box-shadow: none;
   color: #ffffff;
   background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(255, 255, 255, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.28);
 }
 
-.listen-btn-inline svg {
-  width: 20px;
-  height: 20px;
+.message-card-current .listen-btn-inline {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0.5rem;
 }
 
 @media (hover: hover) {
-  .listen-btn:hover:not(:disabled) {
+  .listen-btn:hover:not(:disabled),
+  .listen-btn-inline:hover:not(:disabled) {
     color: #ffffff;
     background: rgba(255, 255, 255, 0.14);
     border-color: rgba(255, 255, 255, 0.48);
@@ -854,14 +872,24 @@ body {
   transform: none;
 }
 
-.listen-btn svg {
+.listen-btn:not(.listen-btn-inline) svg {
   width: 27px;
   height: 27px;
 }
 
-.message-card-current .listen-btn svg {
+.message-card-current .listen-btn:not(.listen-btn-inline) svg {
   width: 29px;
   height: 29px;
+}
+
+.listen-btn-inline svg {
+  width: 20px;
+  height: 20px;
+}
+
+.message-card-current .listen-btn-inline svg {
+  width: 22px;
+  height: 22px;
 }
 
 .icon-btn svg {
