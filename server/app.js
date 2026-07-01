@@ -28,12 +28,15 @@ import { ensureUserRegistryLoaded } from './user-store.js';
 import {
   addVoiceSample,
   clearAllVoiceSamples,
+  deleteVoiceProfileSlot,
   deleteVoiceSample,
   getVoiceProfile,
   listVoiceSampleBuffers,
   MAX_VOICE_SAMPLES,
   resolveVoiceId,
   saveVoiceClone,
+  validateProfileSlot,
+  voiceProfileSummary,
 } from './voice-store.js';
 import {
   createVoiceClone,
@@ -512,6 +515,37 @@ function prepareTextForSpeech(text, lang) {
     .replace(/\s+/g, ' ');
 }
 
+function parseProfileSlot(req, { required = false, fallback = 1 } = {}) {
+  const raw = req.query?.slot ?? req.body?.slot;
+  if (raw == null || raw === '') {
+    if (required) return null;
+    return fallback;
+  }
+  try {
+    return validateProfileSlot(raw);
+  } catch {
+    return required ? null : fallback;
+  }
+}
+
+function requireProfileSlot(req, res, { fallback = 1 } = {}) {
+  const slot = parseProfileSlot(req, { required: fallback == null, fallback });
+  if (slot == null) {
+    res.status(400).json({ error: 'Valid profile slot (1–20) is required' });
+    return null;
+  }
+  return slot;
+}
+
+function formatVoiceProfileResponse(user, voiceProfile) {
+  return {
+    ...voiceProfileSummary(voiceProfile),
+    samples: voiceProfile.samples.map(({ id, createdAt }) => ({ id, createdAt })),
+    voiceReady: Boolean(resolveVoiceId(user, voiceProfile)),
+    elevenlabsConfigured: isElevenLabsConfigured(),
+  };
+}
+
 export function createApp() {
   const app = express();
 
@@ -557,7 +591,7 @@ export function createApp() {
 
     try {
       const { user, recoveryPhrase } = await createUser({ name });
-      const voiceProfile = await getVoiceProfile(user.id);
+      const voiceProfile = await getVoiceProfile(user.id, 1);
       return res.json({
         ok: true,
         user: publicUserProfile(user, voiceProfile),
@@ -573,14 +607,14 @@ export function createApp() {
   app.post('/api/auth/verify', authVerifyRateLimit, async (req, res) => {
     if (!isAuthRequired()) {
       const guest = getGuestUser();
-      const voiceProfile = await getVoiceProfile(guest.id);
+      const voiceProfile = await getVoiceProfile(guest.id, 1);
       return res.json({ ok: true, user: publicUserProfile(guest, voiceProfile) });
     }
 
     const attempt = req.body?.passphrase || req.body?.password;
     const user = await findUserByPassphrase(attempt);
     if (user) {
-      const voiceProfile = await getVoiceProfile(user.id);
+      const voiceProfile = await getVoiceProfile(user.id, 1);
       return res.json({
         ok: true,
         user: publicUserProfile(user, voiceProfile),
@@ -592,49 +626,58 @@ export function createApp() {
   });
 
   app.get('/api/me', requireAppAuth, async (req, res) => {
-    const voiceProfile = await getVoiceProfile(req.user.id);
+    const slot = requireProfileSlot(req, res);
+    if (slot == null) return;
+    const voiceProfile = await getVoiceProfile(req.user.id, slot);
     res.json({
       user: publicUserProfile(req.user, voiceProfile),
-      voiceProfile: {
-        status: voiceProfile.status,
-        sampleCount: voiceProfile.samples.length,
-        voiceReady: Boolean(resolveVoiceId(req.user, voiceProfile)),
-        elevenlabsConfigured: isElevenLabsConfigured(),
-        minSamples: MAX_VOICE_SAMPLES,
-        maxSamples: MAX_VOICE_SAMPLES,
-        canRecordMore: voiceProfile.samples.length < MAX_VOICE_SAMPLES,
-      },
+      voiceProfile: formatVoiceProfileResponse(req.user, voiceProfile),
+      profileSlot: slot,
     });
   });
 
   app.get('/api/voice/profile', requireAppAuth, async (req, res) => {
-    const voiceProfile = await getVoiceProfile(req.user.id);
-    res.json({
-      status: voiceProfile.status,
-      sampleCount: voiceProfile.samples.length,
-      samples: voiceProfile.samples.map(({ id, createdAt }) => ({ id, createdAt })),
-      voiceReady: Boolean(resolveVoiceId(req.user, voiceProfile)),
-      elevenlabsConfigured: isElevenLabsConfigured(),
-      minSamples: MAX_VOICE_SAMPLES,
-      maxSamples: MAX_VOICE_SAMPLES,
-      canRecordMore: voiceProfile.samples.length < MAX_VOICE_SAMPLES,
-    });
+    const slot = requireProfileSlot(req, res);
+    if (slot == null) return;
+    const voiceProfile = await getVoiceProfile(req.user.id, slot);
+    res.json(formatVoiceProfileResponse(req.user, voiceProfile));
+  });
+
+  app.delete('/api/voice/profile', requireAppAuth, async (req, res) => {
+    const slot = requireProfileSlot(req, res);
+    if (slot == null) return;
+    try {
+      const profile = await deleteVoiceProfileSlot(req.user.id, slot);
+      res.json({
+        ok: true,
+        sampleCount: profile.samples.length,
+        status: profile.status,
+        voiceReady: false,
+        canRecordMore: true,
+      });
+    } catch (err) {
+      console.error('Voice profile delete error:', err);
+      res.status(500).json({ error: err.message || 'Could not delete voice profile' });
+    }
   });
 
   app.post('/api/voice/samples', requireAppAuth, voiceSampleRateLimit, upload.single('audio'), async (req, res) => {
+    const slot = requireProfileSlot(req, res);
+    if (slot == null) return;
     if (!req.file?.buffer?.length) {
       return res.status(400).json({ error: 'No audio received' });
     }
 
     try {
       const mimeType = req.file.mimetype || 'audio/webm';
-      const profile = await addVoiceSample(req.user.id, req.file.buffer, mimeType);
+      const profile = await addVoiceSample(req.user.id, slot, req.file.buffer, mimeType);
       res.json({
         ok: true,
         sampleCount: profile.samples.length,
         status: profile.status,
         canRecordMore: profile.samples.length < MAX_VOICE_SAMPLES,
         readyForClone: profile.samples.length >= MAX_VOICE_SAMPLES,
+        profileSlot: slot,
       });
     } catch (err) {
       console.error('Voice sample upload error:', err);
@@ -644,14 +687,17 @@ export function createApp() {
   });
 
   app.delete('/api/voice/samples', requireAppAuth, async (req, res) => {
+    const slot = requireProfileSlot(req, res);
+    if (slot == null) return;
     try {
-      const profile = await clearAllVoiceSamples(req.user.id);
+      const profile = await clearAllVoiceSamples(req.user.id, slot);
       res.json({
         ok: true,
         sampleCount: profile.samples.length,
         status: profile.status,
         voiceReady: false,
         canRecordMore: true,
+        profileSlot: slot,
       });
     } catch (err) {
       console.error('Voice samples reset error:', err);
@@ -660,8 +706,10 @@ export function createApp() {
   });
 
   app.delete('/api/voice/samples/:sampleId', requireAppAuth, async (req, res) => {
+    const slot = requireProfileSlot(req, res);
+    if (slot == null) return;
     try {
-      const profile = await deleteVoiceSample(req.user.id, req.params.sampleId);
+      const profile = await deleteVoiceSample(req.user.id, slot, req.params.sampleId);
       if (!profile) {
         return res.status(404).json({ error: 'Sample not found' });
       }
@@ -670,6 +718,7 @@ export function createApp() {
         sampleCount: profile.samples.length,
         status: profile.status,
         voiceReady: Boolean(resolveVoiceId(req.user, profile)),
+        profileSlot: slot,
       });
     } catch (err) {
       console.error('Voice sample delete error:', err);
@@ -678,28 +727,31 @@ export function createApp() {
   });
 
   app.post('/api/voice/create', requireAppAuth, async (req, res) => {
+    const slot = requireProfileSlot(req, res);
+    if (slot == null) return;
     if (!isElevenLabsConfigured()) {
       return res.status(503).json({ error: 'Voice cloning is not configured on the server' });
     }
 
     try {
-      const { profile, buffers } = await listVoiceSampleBuffers(req.user.id);
+      const { profile, buffers } = await listVoiceSampleBuffers(req.user.id, slot);
       if (buffers.length < MAX_VOICE_SAMPLES) {
         return res.status(400).json({ error: `Record at least ${MAX_VOICE_SAMPLES} voice samples first` });
       }
 
       const voiceId = await createVoiceClone({
-        name: `Lingu ${req.user.name}`,
-        description: `Personal voice profile for ${req.user.name}`,
+        name: `Lingu ${req.user.name} ${slot}`,
+        description: `Personal voice profile ${slot} for ${req.user.name}`,
         samples: buffers,
       });
 
-      const saved = await saveVoiceClone(req.user.id, voiceId);
+      const saved = await saveVoiceClone(req.user.id, slot, voiceId);
       res.json({
         ok: true,
         voiceReady: true,
         status: saved.status,
         sampleCount: saved.samples.length,
+        profileSlot: slot,
       });
     } catch (err) {
       console.error('Voice clone error:', err);
@@ -819,7 +871,9 @@ export function createApp() {
     const wantsClone = req.body.voiceMode !== 'default';
 
     try {
-      const voiceProfile = await getVoiceProfile(req.user.id);
+      const slot = requireProfileSlot(req, res);
+      if (slot == null) return;
+      const voiceProfile = await getVoiceProfile(req.user.id, slot);
       const voiceId = resolveVoiceId(req.user, voiceProfile);
       const useClone = wantsClone && voiceId && supportsClonedVoice(langCode);
 

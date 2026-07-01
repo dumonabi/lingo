@@ -188,6 +188,11 @@ export function mountAuthGate({
       pendingUser = data.user || null;
       pendingSessionToken = data.sessionToken || '';
       if (superPasswordInput) superPasswordInput.value = '';
+      if (pendingUser && pendingRecoveryPhrase) {
+        saveRecoveryPhrase(pendingUser.id, pendingRecoveryPhrase);
+        setAuthToken(pendingSessionToken || pendingRecoveryPhrase);
+        setStoredUser(pendingUser);
+      }
       showRecoveryReveal(gate, pendingRecoveryPhrase);
     } catch {
       showError(errorEl, 'Could not connect — try again');

@@ -256,5 +256,6 @@ export async function resetClientState(page) {
     localStorage.clear();
     sessionStorage.clear();
     indexedDB.deleteDatabase('lingu-pending');
+    indexedDB.deleteDatabase('lingu-auth');
   });
 }

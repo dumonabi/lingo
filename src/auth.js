@@ -5,6 +5,8 @@ import {
   removeKey,
 } from './auth-storage.js';
 
+export { initAuthStorage, persistKey, readPersistedValue };
+
 const AUTH_KEY = 'lingo-access';
 const USER_KEY = 'lingo-user';
 const RECOVERY_PREFIX = 'lingo-recovery:';
@@ -34,8 +36,6 @@ export function isSessionTokenValid(token) {
     return false;
   }
 }
-
-export { initAuthStorage };
 
 export function saveRecoveryPhrase(userId, phrase) {
   if (!userId || !phrase) return;
@@ -171,9 +171,13 @@ export async function apiFetch(url, options = {}) {
   }
 
   if (res.status === 401) {
-    const user = getStoredUser();
-    clearAuthSession(user?.id, { keepRecovery: true });
-    dispatchUnauthorizedOnce();
+    const token = getAuthToken();
+    const hasValidSessionToken = token && isSessionToken(token) && isSessionTokenValid(token);
+    if (!hasValidSessionToken) {
+      const user = getStoredUser();
+      clearAuthSession(user?.id, { keepRecovery: true });
+      dispatchUnauthorizedOnce();
+    }
   }
 
   return res;
@@ -194,15 +198,27 @@ export async function restoreSessionIfPossible() {
   const token = getAuthToken();
   const cachedUser = getStoredUser();
 
+  if (token && isSessionToken(token) && isSessionTokenValid(token) && cachedUser) {
+    return cachedUser;
+  }
+
   if (token && (isSessionToken(token) ? isSessionTokenValid(token) : true)) {
     if (cachedUser) return cachedUser;
-    const data = await fetchCurrentUser();
-    return data?.user || null;
+    try {
+      const data = await fetchCurrentUser();
+      return data?.user || cachedUser || null;
+    } catch {
+      return cachedUser || null;
+    }
   }
 
-  if (await revalidateSession()) {
-    return getStoredUser();
+  try {
+    if (await revalidateSession()) {
+      return getStoredUser();
+    }
+  } catch {
+    return cachedUser || null;
   }
 
-  return null;
+  return cachedUser && token ? cachedUser : null;
 }

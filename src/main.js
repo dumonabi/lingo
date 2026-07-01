@@ -5,9 +5,11 @@ import { CHAMELEON_LOGO_SVG } from './chameleon-logo.js';
 import { $, escapeHtml } from './dom-utils.js';
 import { createMicWave } from './mic-wave.js';
 import { getRecordingMimeType } from './media-utils.js';
-import { apiFetch, clearAuthToken, fetchCurrentUser, getAuthToken, getStoredUser, revalidateSession, restoreSessionIfPossible, setStoredUser } from './auth.js';
+import { apiFetch, clearAuthToken, fetchCurrentUser, getAuthToken, getStoredUser, initAuthStorage, persistKey, readPersistedValue, revalidateSession, restoreSessionIfPossible, setStoredUser } from './auth.js';
 import { mountAuthGate, openAuthGate, resetAuthGate } from './auth-gate.js';
 import { initUserProfile, refreshUserSession } from './user-profile.js';
+import { loadActiveProfileSlot } from './profile-active-slot.js';
+import { readProfileValue, writeProfileValue } from './profile-storage.js';
 import {
   clearAllPendingRecordings,
   isRetryableSendError,
@@ -121,6 +123,10 @@ function prefetchAudio(msg) {
   return loadMessageAudio(msg, { prefetch: true });
 }
 
+function activeSpeakProfileSlot() {
+  return loadActiveProfileSlot(state.user?.id) ?? 1;
+}
+
 function speakModeForMessage(msg) {
   const lang = msg.targetLanguage;
   if (!lang || !state.user?.voiceReady) return 'default';
@@ -138,8 +144,9 @@ function syncListenBtnVoiceMode(msg) {
 
 function audioCacheKey(msg) {
   const userId = state.user?.id || 'default';
+  const slot = activeSpeakProfileSlot();
   const mode = speakModeForMessage(msg);
-  return `${userId}|${mode}|${msg.translated}|${msg.targetLanguage}`;
+  return `${userId}|${slot}|${mode}|${msg.translated}|${msg.targetLanguage}`;
 }
 
 function getMessageCardEl(message) {
@@ -458,6 +465,7 @@ async function loadMessageAudio(msg, { prefetch = false } = {}) {
             text: msg.translated,
             lang: msg.targetLanguage,
             voiceMode: speakModeForMessage(msg),
+            slot: activeSpeakProfileSlot(),
           }),
           signal: controller.signal,
         });
@@ -671,8 +679,12 @@ async function shareTranslation(text, btn) {
 async function init() {
   $('#auth-logo').innerHTML = CHAMELEON_LOGO_SVG;
 
-  const ready = await checkHealth();
-  if (!ready) return;
+  await initAuthStorage();
+
+  const online = await checkHealth();
+  if (!online) {
+    showToast('Offline — using saved session');
+  }
 
   bindKeepWarm();
 
@@ -721,7 +733,7 @@ async function ensureAuthenticated() {
     state.user = user;
     void fetchCurrentUser().then((data) => {
       if (data?.user) state.user = data.user;
-    });
+    }).catch(() => {});
     return true;
   }
 
@@ -794,6 +806,7 @@ function initPickers() {
   picker1 = createLangPicker($('#lang-picker-1'), {
     languages: state.languages,
     value: state.lang1,
+    circle: true,
     placeholder: '',
     onFocusEdit: syncComposeCaret,
     onChange: (code) => {
@@ -810,6 +823,7 @@ function initPickers() {
   picker2 = createLangPicker($('#lang-picker-2'), {
     languages: state.languages,
     value: state.lang2,
+    circle: true,
     placeholder: '',
     onFocusEdit: syncComposeCaret,
     onChange: (code) => {
@@ -828,7 +842,8 @@ function initPickers() {
 
 function loadSavedLanguages() {
   try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY));
+    const raw = readProfileValue(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
   } catch {
     return null;
   }
@@ -916,7 +931,7 @@ function getLanguagePair() {
 }
 
 function saveLanguages() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ lang1: state.lang1, lang2: state.lang2 }));
+  writeProfileValue(STORAGE_KEY, JSON.stringify({ lang1: state.lang1, lang2: state.lang2 }));
 }
 
 function clearConversation() {
@@ -1154,9 +1169,10 @@ async function checkHealth() {
     if (Array.isArray(data.cloneVoiceLanguages) && data.cloneVoiceLanguages.length) {
       cloneVoiceLanguages = new Set(data.cloneVoiceLanguages);
     }
+    void persistKey('lingo-auth-required', authRequired ? '1' : '0');
     return true;
   } catch {
-    showToast('Run: npm run dev');
+    authRequired = readPersistedValue('lingo-auth-required') !== '0';
     return false;
   }
 }

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#050907" />
+    <meta name="theme-color" content="#000000" />
     <meta name="description" content="Lingu.ooo — speak in either language, AI translates automatically" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -21,9 +21,13 @@
   <body>
     <div id="app">
       <section class="language-bar">
-        <div id="lang-picker-1" class="lang-picker-slot"></div>
-        <div id="lang-picker-2" class="lang-picker-slot"></div>
-        <div class="user-profile-slot" id="user-profile-slot"></div>
+        <div class="language-bar-row">
+          <div class="language-bar-langs">
+            <div id="lang-picker-1" class="lang-picker-slot lang-bar-circle-slot"></div>
+            <div id="lang-picker-2" class="lang-picker-slot lang-bar-circle-slot"></div>
+          </div>
+          <div class="user-profile-slot lang-bar-circle-slot" id="user-profile-slot"></div>
+        </div>
       </section>
 
       <section class="compose-box" id="compose-box">

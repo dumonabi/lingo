@@ -14,8 +14,16 @@
 | Name | Value | Environments |
 |------|--------|----------------|
 | `OPENAI_API_KEY` | your key (`sk-...`) | Production, Preview, Development |
+| `SESSION_SECRET` | random string (stable across deploys) | Production |
+| `BLOB_READ_WRITE_TOKEN` | auto-set when you add **Vercel Blob** storage | Production |
 
 Never commit `.env` to GitHub. Users sign in with a **12-word recovery phrase** created in the app (not an env variable).
+
+### Persistent storage on Vercel
+
+Create a **Blob** store in Vercel → Project → Storage → Create → Blob. This sets `BLOB_READ_WRITE_TOKEN` and keeps user accounts, voice samples, and avatars’ server data across deploys and cold starts.
+
+Without Blob, accounts and voice data live in `/tmp` and are lost when the serverless function restarts.
 
 Set a monthly spending limit at [platform.openai.com/settings/organization/limits](https://platform.openai.com/settings/organization/limits).
 
@@ -61,5 +69,6 @@ Vercel **Hobby** only allows built-in cron once per day. For 5–10 min interval
 | `Too many messages this hour` | Rate limit (100 messages/hour per IP). Wait or adjust in `server/security.js` |
 | Function timeout / 504 | Upgrade to Vercel Pro, or use shorter voice messages |
 | Mic not working | Use Chrome or Safari, allow microphone permission, site must be HTTPS |
-| API returns 500 on Vercel | Serverless uses `/tmp` for user/voice data — ensure latest deploy is on **lingo-self** |
+| API returns 500 on Vercel | Add **Vercel Blob** storage and redeploy — see Persistent storage above |
+| Logged out after reinstall / cold start | Ensure Blob store exists; session is saved locally for 1 year |
 | Old UI on `lingu-ooo.vercel.app` | That alias may point to a stale deployment — use **lingo-self.vercel.app** or update the alias in Vercel → Domains |

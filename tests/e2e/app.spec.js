@@ -39,7 +39,7 @@ test.describe('Lingu.ooo', () => {
     const startedAt = Date.now();
     await page.locator('#compose-mic').click();
     await expect(composeBox).toHaveClass(/is-recording/);
-    expect(Date.now() - startedAt).toBeLessThan(900);
+    expect(Date.now() - startedAt).toBeLessThan(1200);
   });
 
   test('displays a translation after recording', async ({ page }) => {

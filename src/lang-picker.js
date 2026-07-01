@@ -1,4 +1,62 @@
 import { createTypingCaret, measureCharCell, positionBlockCaret } from './caret-style.js';
+import {
+  buildLanguageCircleHtml,
+  formatLanguageFlagHtml,
+  getLanguageDisplayName,
+  getLanguageFlag,
+} from './language-flags.js';
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+const WATCH_ROW_SIZES = [3, 4];
+
+function groupLanguagesForWatchGrid(items) {
+  const rows = [];
+  let index = 0;
+  let patternIndex = 0;
+  while (index < items.length) {
+    const capacity = WATCH_ROW_SIZES[patternIndex % WATCH_ROW_SIZES.length];
+    rows.push({
+      capacity,
+      items: items.slice(index, index + capacity),
+    });
+    index += capacity;
+    patternIndex += 1;
+  }
+  return rows;
+}
+
+function buildNumberedCircleHtml(number, { symbol } = {}) {
+  const label = symbol ?? String(number);
+  const labelClass = symbol ? ' lang-picker-circle-label--symbol' : '';
+  return `
+    <span class="lang-picker-circle">
+      <span class="lang-picker-circle-bg lang-picker-circle-bg--empty" aria-hidden="true"></span>
+      <span class="lang-picker-circle-label${labelClass}">${escapeHtml(label)}</span>
+    </span>
+  `.trim();
+}
+
+function renderCircleOption(lang, selectedCode) {
+  return `
+    <button
+      type="button"
+      class="lang-picker-circle-option${lang.code === selectedCode ? ' selected' : ''}"
+      data-code="${escapeHtml(lang.code)}"
+      role="option"
+      aria-label="${escapeHtml(lang.name)}"
+      aria-selected="${lang.code === selectedCode ? 'true' : 'false'}"
+    >
+      ${buildLanguageCircleHtml(lang.code, lang.name)}
+    </button>
+  `.trim();
+}
 
 const LANGUAGE_SEARCH_ALIASES = {
   th: ['thai', 'tailand', 'tailandés', 'tailandes', 'ไทย'],
@@ -18,14 +76,563 @@ const LANGUAGE_SEARCH_ALIASES = {
 };
 
 const langPickerRegistry = [];
+const openCirclePanels = new Set();
 
-export function hideAllLangPickerCarets() {
-  for (const entry of langPickerRegistry) {
-    entry.hideCaret();
+window.addEventListener('lingo:close-lang-pickers', () => {
+  closeAllCirclePanels();
+});
+
+function closeAllCirclePanels(except = null) {
+  for (const close of openCirclePanels) {
+    if (close !== except) close();
   }
 }
 
-export function createLangPicker(container, {
+export function hideAllLangPickerCarets() {
+  for (const entry of langPickerRegistry) {
+    entry.hideCaret?.();
+  }
+}
+
+export function createLangPicker(container, options = {}) {
+  if (options.circle) {
+    return createCircleLangPicker(container, options);
+  }
+  return createClassicLangPicker(container, options);
+}
+
+function createCircleLangPicker(container, {
+  languages: initialLanguages = [],
+  value,
+  onChange,
+  onFocusEdit,
+  closeProfileOnOpen = true,
+} = {}) {
+  let languages = [...initialLanguages];
+  let selectedCode = value || '';
+  let closePanel = () => {};
+
+  const root = document.createElement('div');
+  root.className = 'lang-picker lang-picker--circle';
+
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'lang-picker-circle-trigger';
+  trigger.setAttribute('aria-haspopup', 'listbox');
+
+  const panel = document.createElement('div');
+  panel.className = 'lang-picker-circle-panel';
+  panel.hidden = true;
+
+  const list = document.createElement('div');
+  list.className = 'lang-picker-circle-grid';
+  list.setAttribute('role', 'listbox');
+
+  panel.append(list);
+  root.append(trigger, panel);
+  container.appendChild(root);
+
+  langPickerRegistry.push({});
+
+  function findLang(code) {
+    return languages.find((l) => l.code === code);
+  }
+
+  function sortedLanguages() {
+    return [...languages].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  function syncTrigger() {
+    const lang = findLang(selectedCode);
+    trigger.innerHTML = lang
+      ? buildLanguageCircleHtml(lang.code, lang.name)
+      : buildLanguageCircleHtml('', '', { extraClass: 'lang-picker-circle--empty' });
+    trigger.setAttribute('aria-label', lang?.name || 'Choose language');
+  }
+
+  function setPanelOpen(open) {
+    panel.hidden = !open;
+    trigger.setAttribute('aria-expanded', String(open));
+    if (open) {
+      if (closeProfileOnOpen) {
+        window.dispatchEvent(new CustomEvent('lingo:close-profile-menu'));
+      }
+      closeAllCirclePanels(closePanel);
+      renderList();
+    }
+  }
+
+  closePanel = () => setPanelOpen(false);
+
+  function renderList() {
+    const items = sortedLanguages();
+    const rows = groupLanguagesForWatchGrid(items);
+    list.innerHTML = rows
+      .map(({ capacity, items: rowItems }) => `
+        <div
+          class="lang-picker-circle-row lang-picker-circle-row--${capacity}"
+          role="presentation"
+        >
+          ${rowItems.map((lang) => renderCircleOption(lang, selectedCode)).join('')}
+        </div>
+      `)
+      .join('');
+    list.hidden = items.length === 0;
+  }
+
+  function select(code) {
+    if (!code) return;
+    if (code !== selectedCode) {
+      selectedCode = code;
+      onChange(code);
+    }
+    syncTrigger();
+    setPanelOpen(false);
+    trigger.focus();
+  }
+
+  trigger.addEventListener('click', (event) => {
+    event.stopPropagation();
+    onFocusEdit?.();
+    setPanelOpen(panel.hidden);
+  });
+
+  list.addEventListener('click', (event) => {
+    const option = event.target.closest('.lang-picker-circle-option');
+    if (option) select(option.dataset.code);
+  });
+
+  document.addEventListener('pointerdown', (event) => {
+    if (!root.contains(event.target)) setPanelOpen(false);
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !panel.hidden) {
+      event.stopPropagation();
+      setPanelOpen(false);
+      trigger.focus();
+    }
+  });
+
+  openCirclePanels.add(closePanel);
+
+  function setValue(code) {
+    selectedCode = code || '';
+    syncTrigger();
+  }
+
+  function setLanguages(nextLanguages) {
+    languages = Array.isArray(nextLanguages) ? [...nextLanguages] : [];
+    if (selectedCode && !findLang(selectedCode)) {
+      selectedCode = languages[0]?.code || '';
+      if (selectedCode) onChange(selectedCode);
+    }
+    syncTrigger();
+    if (!panel.hidden) renderList();
+  }
+
+  syncTrigger();
+
+  return { setValue, getValue: () => selectedCode, setLanguages };
+}
+
+export function createNumberedCirclePicker(container, {
+  count = 20,
+  value = null,
+  onChange,
+  onOptionAction,
+  onFocusEdit,
+  triggerHtml = '',
+  getTriggerHtml = null,
+  customOptions = {},
+} = {}) {
+  let selected = value;
+  let closePanel = () => {};
+
+  const root = document.createElement('div');
+  root.className = 'lang-picker lang-picker--circle';
+
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'lang-picker-circle-trigger';
+  trigger.setAttribute('aria-haspopup', 'listbox');
+
+  const panel = document.createElement('div');
+  panel.className = 'lang-picker-circle-panel';
+  panel.hidden = true;
+
+  const list = document.createElement('div');
+  list.className = 'lang-picker-circle-grid';
+  list.setAttribute('role', 'listbox');
+
+  panel.append(list);
+  root.append(trigger, panel);
+  container.appendChild(root);
+
+  function syncTrigger() {
+    trigger.innerHTML = getTriggerHtml?.() ?? triggerHtml;
+    trigger.setAttribute('aria-label', selected ? `User menu, option ${selected}` : 'User menu');
+  }
+
+  function setPanelOpen(open) {
+    panel.hidden = !open;
+    trigger.setAttribute('aria-expanded', String(open));
+    if (open) {
+      closeAllCirclePanels(closePanel);
+      renderList();
+    }
+  }
+
+  closePanel = () => setPanelOpen(false);
+
+  function renderList() {
+    const menuNumbers = Array.from({ length: count }, (_, index) => index + 1);
+    const rows = groupLanguagesForWatchGrid(menuNumbers);
+    list.innerHTML = rows
+      .map(({ capacity, items: rowItems }) => `
+        <div
+          class="lang-picker-circle-row lang-picker-circle-row--${capacity}"
+          role="presentation"
+        >
+          ${rowItems.map((number) => {
+            const option = customOptions[number];
+            const ariaLabel = option?.ariaLabel ?? String(number);
+            const symbol = option?.symbol;
+            const innerHtml = option?.html ?? buildNumberedCircleHtml(number, { symbol });
+            return `
+            <button
+              type="button"
+              class="lang-picker-circle-option${number === selected ? ' selected' : ''}"
+              data-value="${number}"
+              role="option"
+              aria-label="${escapeHtml(ariaLabel)}"
+              aria-selected="${number === selected ? 'true' : 'false'}"
+            >
+              ${innerHtml}
+            </button>
+          `;
+          }).join('')}
+        </div>
+      `)
+      .join('');
+    list.hidden = menuNumbers.length === 0;
+  }
+
+  function select(number) {
+    const next = Number(number);
+    if (!next) return;
+    if (onOptionAction?.(next)) {
+      setPanelOpen(false);
+      trigger.focus();
+      return;
+    }
+    selected = next;
+    onChange?.(next);
+    syncTrigger();
+    setPanelOpen(false);
+    trigger.focus();
+  }
+
+  trigger.addEventListener('click', (event) => {
+    event.stopPropagation();
+    onFocusEdit?.();
+    setPanelOpen(panel.hidden);
+  });
+
+  list.addEventListener('click', (event) => {
+    const option = event.target.closest('.lang-picker-circle-option');
+    if (option) select(option.dataset.value);
+  });
+
+  document.addEventListener('pointerdown', (event) => {
+    if (!root.contains(event.target)) setPanelOpen(false);
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !panel.hidden) {
+      event.stopPropagation();
+      setPanelOpen(false);
+      trigger.focus();
+    }
+  });
+
+  openCirclePanels.add(closePanel);
+  syncTrigger();
+
+  return {
+    setValue: (next) => {
+      selected = next;
+      syncTrigger();
+      if (!panel.hidden) renderList();
+    },
+    getValue: () => selected,
+    refreshTrigger: syncTrigger,
+    close: closePanel,
+  };
+}
+
+export function createCollapsibleNumberedCircleGrid(container, {
+  count = 20,
+  items = null,
+  value = null,
+  open = false,
+  panelContainer = null,
+  onOpenChange,
+  getTriggerHtml,
+  onChange,
+  onOptionAction,
+  customOptions = {},
+} = {}) {
+  let selected = value;
+  let expanded = open;
+
+  const root = document.createElement('div');
+  root.className = 'lang-picker-collapsible-numbered-grid';
+
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'lang-picker-collapsible-user-trigger lang-bar-circle-slot';
+  trigger.setAttribute('aria-haspopup', 'listbox');
+
+  const panel = document.createElement('div');
+  panel.className = 'lang-picker-collapsible-user-panel';
+  panel.hidden = !expanded;
+
+  const list = document.createElement('div');
+  list.className = 'lang-picker-circle-grid';
+  list.setAttribute('role', 'listbox');
+  list.setAttribute('aria-label', 'User options');
+
+  panel.append(list);
+  root.append(trigger);
+  container.appendChild(root);
+  (panelContainer || root).appendChild(panel);
+
+  function getMenuItems() {
+    if (Array.isArray(items) && items.length) return items;
+    return Array.from({ length: count }, (_, index) => ({ key: index + 1 }));
+  }
+
+  function resolveMenuItem(key) {
+    const normalized = String(key);
+    const fromItems = getMenuItems().find((item) => String(item.key) === normalized);
+    if (fromItems) return fromItems;
+    const numeric = Number(normalized);
+    return customOptions[numeric] || customOptions[normalized] || null;
+  }
+
+  function parseOptionKey(rawKey) {
+    if (rawKey === 'add') return 'add';
+    const numeric = Number(rawKey);
+    if (Number.isNaN(numeric)) return null;
+    return numeric;
+  }
+
+  function syncTrigger() {
+    trigger.innerHTML = getTriggerHtml?.({ selected, expanded }) ?? '';
+    trigger.setAttribute('aria-expanded', String(expanded));
+    trigger.setAttribute(
+      'aria-label',
+      selected ? `User ${selected}, ${expanded ? 'collapse' : 'expand'} menu` : `User menu, ${expanded ? 'collapse' : 'expand'}`,
+    );
+    root.classList.toggle('is-expanded', expanded);
+  }
+
+  function setExpanded(next) {
+    expanded = next;
+    panel.hidden = !expanded;
+    if (panelContainer) panelContainer.hidden = !expanded;
+    syncTrigger();
+    if (expanded) renderList();
+    onOpenChange?.(expanded);
+  }
+
+  function renderList() {
+    const menuItems = getMenuItems();
+    const rows = groupLanguagesForWatchGrid(menuItems.map((item) => item.key));
+    list.innerHTML = rows
+      .map(({ capacity, items: rowItems }) => `
+        <div
+          class="lang-picker-circle-row lang-picker-circle-row--${capacity}"
+          role="presentation"
+        >
+          ${rowItems.map((key) => {
+            const item = resolveMenuItem(key) || { key };
+            const ariaLabel = item.ariaLabel ?? String(key);
+            const symbol = item.symbol;
+            const innerHtml = item.html ?? buildNumberedCircleHtml(key, { symbol });
+            const isSelected = String(selected) === String(key);
+            return `
+            <button
+              type="button"
+              class="lang-picker-circle-option${isSelected ? ' selected' : ''}${item.menuClass ? ` ${item.menuClass}` : ''}"
+              data-value="${escapeHtml(String(key))}"
+              role="option"
+              aria-label="${escapeHtml(ariaLabel)}"
+              aria-selected="${isSelected ? 'true' : 'false'}"
+            >
+              ${innerHtml}
+            </button>
+          `;
+          }).join('')}
+        </div>
+      `)
+      .join('');
+    list.hidden = menuItems.length === 0;
+  }
+
+  function isEventInsidePicker(event) {
+    const target = event.target;
+    if (root.contains(target)) return true;
+    if (panelContainer?.contains(target)) return true;
+    return false;
+  }
+
+  function select(rawKey) {
+    const next = parseOptionKey(rawKey);
+    if (next === null) return;
+    if (onOptionAction?.(next)) {
+      return;
+    }
+    selected = next;
+    onChange?.(next);
+    renderList();
+    syncTrigger();
+  }
+
+  trigger.addEventListener('click', (event) => {
+    event.stopPropagation();
+    setExpanded(!expanded);
+  });
+
+  list.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const option = event.target.closest('.lang-picker-circle-option');
+    if (option) select(option.dataset.value);
+  });
+
+  list.addEventListener('pointerdown', (event) => {
+    event.stopPropagation();
+  });
+
+  document.addEventListener('pointerdown', (event) => {
+    if (expanded && !isEventInsidePicker(event)) {
+      setExpanded(false);
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && expanded) {
+      event.stopPropagation();
+      setExpanded(false);
+      trigger.focus();
+    }
+  });
+
+  syncTrigger();
+  if (panelContainer) panelContainer.hidden = !expanded;
+  if (expanded) renderList();
+
+  return {
+    setValue: (next) => {
+      selected = next;
+      renderList();
+      syncTrigger();
+    },
+    getValue: () => selected,
+    refresh: () => {
+      renderList();
+      syncTrigger();
+    },
+    refreshTrigger: syncTrigger,
+    setExpanded,
+    isExpanded: () => expanded,
+    close: () => setExpanded(false),
+  };
+}
+
+export function createInlineNumberedCircleGrid(container, {
+  count = 20,
+  value = null,
+  onChange,
+  onOptionAction,
+  customOptions = {},
+} = {}) {
+  let selected = value;
+
+  const root = document.createElement('div');
+  root.className = 'lang-picker-inline-numbered-grid';
+
+  const list = document.createElement('div');
+  list.className = 'lang-picker-circle-grid';
+  list.setAttribute('role', 'listbox');
+  list.setAttribute('aria-label', 'User options');
+
+  root.append(list);
+  container.appendChild(root);
+
+  function renderList() {
+    const menuNumbers = Array.from({ length: count }, (_, index) => index + 1);
+    const rows = groupLanguagesForWatchGrid(menuNumbers);
+    list.innerHTML = rows
+      .map(({ capacity, items: rowItems }) => `
+        <div
+          class="lang-picker-circle-row lang-picker-circle-row--${capacity}"
+          role="presentation"
+        >
+          ${rowItems.map((number) => {
+            const option = customOptions[number];
+            const ariaLabel = option?.ariaLabel ?? String(number);
+            const symbol = option?.symbol;
+            const innerHtml = option?.html ?? buildNumberedCircleHtml(number, { symbol });
+            return `
+            <button
+              type="button"
+              class="lang-picker-circle-option${number === selected ? ' selected' : ''}"
+              data-value="${number}"
+              role="option"
+              aria-label="${escapeHtml(ariaLabel)}"
+              aria-selected="${number === selected ? 'true' : 'false'}"
+            >
+              ${innerHtml}
+            </button>
+          `;
+          }).join('')}
+        </div>
+      `)
+      .join('');
+    list.hidden = menuNumbers.length === 0;
+  }
+
+  function select(number) {
+    const next = Number(number);
+    if (!next) return;
+    if (onOptionAction?.(next)) {
+      return;
+    }
+    selected = next;
+    onChange?.(next);
+    renderList();
+  }
+
+  list.addEventListener('click', (event) => {
+    const option = event.target.closest('.lang-picker-circle-option');
+    if (option) select(option.dataset.value);
+  });
+
+  renderList();
+
+  return {
+    setValue: (next) => {
+      selected = next;
+      renderList();
+    },
+    getValue: () => selected,
+    refresh: renderList,
+  };
+}
+
+function createClassicLangPicker(container, {
   languages: initialLanguages = [],
   value,
   onChange,
@@ -51,7 +658,11 @@ export function createLangPicker(container, {
   const selectedName = document.createElement('span');
   selectedName.className = 'lang-picker-selected-name';
 
-  selectedRow.append(selectedName);
+  const selectedFlag = document.createElement('span');
+  selectedFlag.className = 'lang-picker-flag';
+  selectedFlag.setAttribute('aria-hidden', 'true');
+
+  selectedRow.append(selectedName, selectedFlag);
 
   const mirror = document.createElement('div');
   mirror.className = 'compose-caret-mirror lang-picker-caret-mirror';
@@ -114,17 +725,24 @@ export function createLangPicker(container, {
   function renderList() {
     const items = filteredLanguages();
     list.innerHTML = items
-      .map((l) => `
-      <li class="lang-picker-option${l.code === selectedCode ? ' selected' : ''}" data-code="${l.code}" role="option">
-        <span class="lang-picker-name">${l.name}</span>
-      </li>`)
+      .map((l) => {
+        const label = getLanguageDisplayName(l.code, l.name);
+        return `
+      <li class="lang-picker-option${l.code === selectedCode ? ' selected' : ''}" data-code="${l.code}" role="option" aria-label="${escapeHtml(l.name)}">
+        <span class="lang-picker-name">${escapeHtml(label)}</span>
+        ${formatLanguageFlagHtml(l.code)}
+      </li>`;
+      })
       .join('');
     list.hidden = items.length === 0;
   }
 
   function syncSelectedRow() {
     const lang = findLang(selectedCode);
-    selectedName.textContent = lang?.name || '';
+    selectedName.textContent = lang ? getLanguageDisplayName(lang.code, lang.name) : '';
+    const flag = lang ? getLanguageFlag(lang.code) : '';
+    selectedFlag.textContent = flag;
+    selectedFlag.classList.toggle('lang-picker-flag--empty', !flag);
   }
 
   function syncCaret() {
@@ -180,7 +798,7 @@ export function createLangPicker(container, {
 
   function showSelectedDisplay() {
     const lang = findLang(selectedCode);
-    input.value = lang ? lang.name : '';
+    input.value = lang ? getLanguageDisplayName(lang.code, lang.name) : '';
     input.placeholder = lang ? '' : placeholder;
     inputWrap.classList.remove('is-editing');
     field.classList.remove('is-editing');

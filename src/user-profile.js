@@ -1,19 +1,35 @@
 import { apiFetch, clearAuthSession, fetchCurrentUser, getAuthToken, getRecoveryPhrase, getStoredUser, setStoredUser } from './auth.js';
-import { createLangPicker, hideAllLangPickerCarets } from './lang-picker.js';
+import { createLangPicker, createCollapsibleNumberedCircleGrid, hideAllLangPickerCarets } from './lang-picker.js';
+import {
+  buildPaintedMenuCircleHtml,
+  clearCirclePaint,
+  initProfileCirclePaint,
+  loadCirclePaint,
+  saveCirclePaint,
+} from './profile-circle-paint.js';
+import {
+  addProfileSlot,
+  canDeleteProfileSlot,
+  deleteProfileSlot,
+  loadProfileSlotNumbers,
+  MAX_PROFILE_SLOTS,
+} from './profile-slots.js';
 import { $, escapeHtml } from './dom-utils.js';
 import { createMicWave } from './mic-wave.js';
 import { getRecordingMimeType } from './media-utils.js';
 import { formatCloneVoiceLanguageList } from './elevenlabs-languages.js';
+import {
+  getProfileMenuSelectionStorageKey,
+  loadActiveProfileSlot,
+  voiceApiPath,
+} from './profile-active-slot.js';
+import { readProfileValue, writeProfileValue } from './profile-storage.js';
 import { getVoicePrompt, getVoiceUi, resolveVoiceLanguage, VOICE_SAMPLE_TARGET } from './voice-prompts.js';
 
 const profileMicWave = createMicWave();
 let profileWaveRaf = null;
 
-const USER_PROFILE_TRIGGER_ICON = `
-  <span class="user-profile-trigger-icon" aria-hidden="true">
-    <svg class="user-profile-user-icon" viewBox="0 0 24 24" fill="currentColor">
-      <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
-    </svg>
+const USER_PROFILE_BADGES_HTML = `
     <span class="user-profile-badge user-profile-badge--plus">
       <svg viewBox="0 0 10 10" fill="none" aria-hidden="true">
         <path d="M5 1.5v7M1.5 5h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
@@ -29,14 +45,127 @@ const USER_PROFILE_TRIGGER_ICON = `
         <path d="M2 5h6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
       </svg>
     </span>
-  </span>
 `;
 
-const PROFILE_SAMPLES_SAVED_ICON_SVG = `
-  <svg class="user-profile-samples-saved-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-    <path fill-rule="evenodd" d="M8,2 C8.55228475,2 9,2.44771525 9,3 L9,21 C9,21.5522847 8.55228475,22 8,22 C7.44771525,22 7,21.5522847 7,21 L7,3 C7,2.44771525 7.44771525,2 8,2 Z M20,4 C20.5522847,4 21,4.44771525 21,5 L21,19 C21,19.5522847 20.5522847,20 20,20 C19.4477153,20 19,19.5522847 19,19 L19,5 C19,4.44771525 19.4477153,4 20,4 Z M12,6 C12.5522847,6 13,6.44771525 13,7 L13,17 C13,17.5522847 12.5522847,18 12,18 C11.4477153,18 11,17.5522847 11,17 L11,7 C11,6.44771525 11.4477153,6 12,6 Z M4,9 C4.55228475,9 5,9.44771525 5,10 L5,14 C5,14.5522847 4.55228475,15 4,15 C3.44771525,15 3,14.5522847 3,14 L3,10 C3,9.44771525 3.44771525,9 4,9 Z M16,10 C16.5522847,10 17,10.4477153 17,11 L17,13 C17,13.5522847 16.5522847,14 16,14 C15.4477153,14 15,13.5522847 15,13 L15,11 C15,10.4477153 15.4477153,10 16,10 Z"/>
+function loadProfileUserMenuSelection(userId) {
+  if (!userId) return null;
+  try {
+    const raw = readProfileValue(getProfileMenuSelectionStorageKey(userId));
+    if (!raw) return null;
+    const number = Number(raw);
+    return number >= 1 && number <= MAX_PROFILE_SLOTS ? number : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveProfileUserMenuSelection(userId, number) {
+  if (!userId || !number) return;
+  try {
+    writeProfileValue(getProfileMenuSelectionStorageKey(userId), String(number));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function buildProfileAvatarCircleContent(selection, sessionUserId) {
+  if (!selection) {
+    return '<span class="lang-picker-circle-bg user-profile-circle-bg" aria-hidden="true">🪪</span>';
+  }
+  const paint = sessionUserId ? loadCirclePaint(sessionUserId, selection) : '';
+  if (paint) {
+    const safeUrl = paint.replace(/'/g, '%27');
+    return `<span class="lang-picker-circle-bg lang-picker-circle-bg--empty user-profile-paint-preview-bg" style="background-image:url('${safeUrl}')" aria-hidden="true"></span>`;
+  }
+  if (selection === 11) {
+    return `
+      <span class="lang-picker-circle-bg lang-picker-circle-bg--empty" aria-hidden="true"></span>
+      <span class="lang-picker-circle-label lang-picker-circle-label--symbol">${PROFILE_USER_MENU_OPTION_11_SYMBOL}</span>
+    `.trim();
+  }
+  return `
+    <span class="lang-picker-circle-bg lang-picker-circle-bg--empty" aria-hidden="true"></span>
+    <span class="lang-picker-circle-label">${escapeHtml(String(selection))}</span>
+  `.trim();
+}
+
+function buildProfileAvatarCircleHtml(selection, sessionUserId, { badges = false } = {}) {
+  const painted = selection && sessionUserId && loadCirclePaint(sessionUserId, selection);
+  return `
+    <span class="lang-picker-circle user-profile-circle${painted ? ' user-profile-avatar--painted' : ''}">
+      ${buildProfileAvatarCircleContent(selection, sessionUserId)}
+      ${badges ? USER_PROFILE_BADGES_HTML : ''}
+    </span>
+  `.trim();
+}
+
+const PROFILE_SWITCH_USER_ICON_SVG = `
+  <svg class="user-profile-switch-user-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <circle cx="9" cy="7" r="3.5"></circle>
+    <path d="M2.5 19.5c0-3.2 2.8-5.5 6.5-5.5s6.5 2.3 6.5 5.5"></path>
+    <circle cx="17.5" cy="8" r="2.5"></circle>
+    <path d="M21 18.5c0-2.2-1.8-4-4-4"></path>
   </svg>
 `;
+
+const PROFILE_EDIT_USER_ICON_SVG = `
+  <svg class="user-profile-edit-user-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M12 20h9"></path>
+    <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"></path>
+  </svg>
+`;
+
+function buildProfileCollapsibleUserTriggerHtml(selection) {
+  const selectionLabel = selection ? String(selection) : '';
+  return `
+    <span class="lang-picker-circle user-profile-circle user-profile-switch-user-circle">
+      <span class="lang-picker-circle-bg lang-picker-circle-bg--empty user-profile-switch-user-bg" aria-hidden="true"></span>
+      <span class="lang-picker-circle-label lang-picker-circle-label--symbol user-profile-switch-user-glyph">${PROFILE_SWITCH_USER_ICON_SVG}</span>
+      ${selectionLabel ? `<span class="user-profile-switch-user-number">${escapeHtml(selectionLabel)}</span>` : ''}
+    </span>
+  `.trim();
+}
+
+function buildProfileEditUserButtonHtml(selection, sessionUserId) {
+  const painted = selection && sessionUserId && loadCirclePaint(sessionUserId, selection);
+  const inner = selection
+    ? buildProfileAvatarCircleContent(selection, sessionUserId)
+    : '<span class="lang-picker-circle-bg lang-picker-circle-bg--empty user-profile-collapsible-empty-bg" aria-hidden="true"></span>';
+  return `
+    <span class="lang-picker-circle user-profile-circle user-profile-edit-user-circle${painted ? ' user-profile-avatar--painted' : ''}">
+      ${inner}
+      <span class="user-profile-badge user-profile-collapsible-badge user-profile-edit-user-badge" aria-hidden="true">${PROFILE_EDIT_USER_ICON_SVG}</span>
+    </span>
+  `.trim();
+}
+
+function syncProfileAvatarDisplay() {
+  const user = getStoredUser();
+  const userId = user?.id || '';
+  const selection = profileUserMenuSelection;
+
+  const trigger = $('#user-profile-trigger', rootEl);
+  if (trigger) {
+    trigger.innerHTML = buildProfileAvatarCircleHtml(selection, userId, { badges: true });
+  }
+
+  profileUserMenuPicker?.refreshTrigger?.();
+  if (profileUserMenuPicker?.isExpanded?.()) {
+    profileUserMenuPicker?.refresh?.();
+  }
+
+  const editBtn = $('#user-profile-edit-user-btn', rootEl);
+  if (editBtn) {
+    const userId = user?.id || '';
+    editBtn.innerHTML = buildProfileEditUserButtonHtml(selection, userId);
+    editBtn.disabled = !selection;
+  }
+}
+
+function buildProfileCircleMarkup() {
+  const user = getStoredUser();
+  return buildProfileAvatarCircleHtml(profileUserMenuSelection, user?.id, { badges: true });
+}
 
 const PROFILE_SPEAK_AUDIO_ICON_SVG = `
   <svg class="user-profile-speak-audio-icon" viewBox="0 0 512 512" fill="currentColor" aria-hidden="true">
@@ -49,8 +178,6 @@ const PROFILE_CHECK_ICON = (className) => `
     <path d="M5 13l4 4L19 7" />
   </svg>
 `;
-
-const PROFILE_SAMPLES_COMPLETE_SVG = PROFILE_CHECK_ICON('user-profile-samples-complete-icon');
 
 const PROFILE_RECORDING_MIC_SVG = `
   <svg class="compose-mic-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -93,11 +220,20 @@ const PROFILE_RECORDING_CANCEL_SVG = `
 const SUPER_USER_ID = 'u-super';
 const VOICE_LANG_PREFIX = 'lingo-voice-lang:';
 
-const PROFILE_VOICE_LANGUAGES = [
+const PROFILE_OFFLINE_LANGUAGES = [
   { code: 'en', name: 'English' },
   { code: 'es', name: 'Spanish' },
   { code: 'th', name: 'Thai' },
+  { code: 'zh', name: 'Chinese' },
+  { code: 'fr', name: 'French' },
+  { code: 'de', name: 'German' },
+  { code: 'ja', name: 'Japanese' },
+  { code: 'ar', name: 'Arabic' },
+  { code: 'pt', name: 'Portuguese' },
+  { code: 'it', name: 'Italian' },
 ];
+
+const PROFILE_VOICE_LANGUAGES = PROFILE_OFFLINE_LANGUAGES;
 
 let rootEl = null;
 let menuOpen = false;
@@ -109,6 +245,17 @@ let onUserChange = null;
 let showToastFn = () => {};
 let profileLanguages = [];
 let voiceLang = 'en';
+const PROFILE_USER_MENU_OPTION_11_SYMBOL = '◎';
+
+let profileUserMenuSelection = null;
+let profileUserMenuPicker = null;
+let profileUserGridOpen = false;
+let paintEditSlotNumber = null;
+let paintEditIsNew = false;
+const draftProfileSlotKeys = new Set();
+let option11PageOpen = false;
+let voiceSamplesPageOpen = false;
+let profileCirclePaint = null;
 
 const MIN_SAMPLES = VOICE_SAMPLE_TARGET;
 
@@ -124,16 +271,50 @@ function applyDisplayName(user) {
   return user;
 }
 
-function getVoiceLangStorageKey(userId) {
-  return `${VOICE_LANG_PREFIX}${userId}`;
+function getCurrentProfileSlot() {
+  const userId = getStoredUser()?.id;
+  if (!userId) return null;
+  return profileUserMenuSelection ?? loadProfileUserMenuSelection(userId) ?? loadActiveProfileSlot(userId);
 }
 
-function loadVoiceLangPrefs(user) {
+function syncStoredUserVoiceState() {
+  const user = getStoredUser();
   if (!user) return;
+  const updated = {
+    ...user,
+    voiceReady: voiceProfile?.voiceReady ?? false,
+    voiceSampleCount: voiceProfile?.sampleCount ?? 0,
+    voiceStatus: voiceProfile?.status ?? 'none',
+    activeProfileSlot: getCurrentProfileSlot(),
+  };
+  setStoredUser(updated);
+  onUserChange?.(updated);
+}
+
+async function deleteProfileSlotVoice(sessionUserId, slotNumber) {
+  if (!sessionUserId || !slotNumber) return;
+  try {
+    await apiFetch(voiceApiPath('/api/voice/profile', slotNumber), { method: 'DELETE' });
+  } catch {
+    // ignore network errors
+  }
+}
+
+export function getActiveProfileSlotNumber() {
+  return getCurrentProfileSlot();
+}
+
+function getVoiceLangStorageKey(userId, slotNumber) {
+  return `${VOICE_LANG_PREFIX}${userId}:${slotNumber}`;
+}
+
+function loadVoiceLangPrefs(user, slotNumber = getCurrentProfileSlot()) {
+  if (!user || !slotNumber) return;
   try {
     voiceLang = resolveVoiceLanguage(
-      localStorage.getItem(getVoiceLangStorageKey(user.id))
-      || localStorage.getItem(`${VOICE_LANG_PREFIX}primary:${user.id}`)
+      readProfileValue(getVoiceLangStorageKey(user.id, slotNumber))
+      || readProfileValue(`${VOICE_LANG_PREFIX}${user.id}`)
+      || readProfileValue(`${VOICE_LANG_PREFIX}primary:${user.id}`)
       || 'en',
     );
   } catch {
@@ -141,33 +322,43 @@ function loadVoiceLangPrefs(user) {
   }
 }
 
-function saveVoiceLangPref(userId, code) {
-  if (!userId) return;
+function saveVoiceLangPref(userId, code, slotNumber = getCurrentProfileSlot()) {
+  if (!userId || !slotNumber) return;
   try {
-    localStorage.setItem(getVoiceLangStorageKey(userId), resolveVoiceLanguage(code));
+    writeProfileValue(getVoiceLangStorageKey(userId, slotNumber), resolveVoiceLanguage(code));
   } catch {
     // ignore storage errors
   }
 }
 
-function updateVoicePromptText(panel) {
+function updateVoicePromptText() {
   const user = getStoredUser();
   if (!user) return;
+  const page = $('#user-profile-voice-samples-page', rootEl);
+  if (!page) return;
   const state = getProfileState(user);
   const prompt = getVoicePrompt(
     voiceLang,
     nextPromptIndex(state.sampleCount, state.maxSamples),
   );
-  const el = $('.user-profile-prompt-text', panel);
+  const el = $('.user-profile-prompt-text', page);
   if (el) el.textContent = `"${prompt}"`;
 }
 
 async function ensureProfileLanguages() {
-  profileLanguages = [...PROFILE_VOICE_LANGUAGES];
+  if (profileLanguages.length) return profileLanguages;
+  try {
+    const res = await apiFetch('/api/languages');
+    if (!res.ok) throw new Error('Failed to load languages');
+    profileLanguages = await res.json();
+  } catch {
+    profileLanguages = [...PROFILE_OFFLINE_LANGUAGES];
+  }
+  return profileLanguages;
 }
 
-function setupProfileLangPicker(panel, user) {
-  const slot = $('#user-profile-lang', panel);
+function setupProfileLangPicker(root, user, langSlotId = 'user-profile-voice-samples-lang') {
+  const slot = $(`#${langSlotId}`, root);
   if (!slot || !profileLanguages.length) return;
 
   slot.innerHTML = '';
@@ -175,9 +366,11 @@ function setupProfileLangPicker(panel, user) {
   createLangPicker(slot, {
     languages: profileLanguages,
     value: voiceLang,
+    circle: true,
+    closeProfileOnOpen: false,
     onChange: (code) => {
       voiceLang = resolveVoiceLanguage(code);
-      saveVoiceLangPref(user.id, voiceLang);
+      saveVoiceLangPref(user.id, code, getCurrentProfileSlot());
       renderMenuContent();
     },
     onFocusEdit: () => {
@@ -186,11 +379,200 @@ function setupProfileLangPicker(panel, user) {
   });
 }
 
-function syncPanelPosition() {
-  const bar = document.querySelector('.language-bar');
-  const panel = $('#user-profile-panel', rootEl);
-  if (!bar || !panel) return;
-  panel.style.setProperty('--user-profile-panel-top', `${bar.getBoundingClientRect().bottom}px`);
+function buildProfileMenuItems(sessionUserId) {
+  const slotNumbers = loadProfileSlotNumbers(sessionUserId);
+  const items = slotNumbers.map((number) => {
+    const paint = loadCirclePaint(sessionUserId, number);
+    return {
+      key: number,
+      ariaLabel: `User ${number}`,
+      html: paint ? buildPaintedMenuCircleHtml(paint) : undefined,
+      symbol: paint ? undefined : (number === 11 ? PROFILE_USER_MENU_OPTION_11_SYMBOL : String(number)),
+    };
+  });
+
+  if (slotNumbers.length < MAX_PROFILE_SLOTS) {
+    items.push({
+      key: 'add',
+      ariaLabel: 'Add user',
+      symbol: '+',
+      menuClass: 'user-profile-menu-add-option',
+    });
+  }
+
+  return items;
+}
+
+function getDraftProfileSlotKey(sessionUserId, slotNumber) {
+  return `${sessionUserId}:${slotNumber}`;
+}
+
+function isDraftProfileSlot(sessionUserId, slotNumber) {
+  return draftProfileSlotKeys.has(getDraftProfileSlotKey(sessionUserId, slotNumber));
+}
+
+function openPaintEditor(slotNumber, { isNew = false } = {}) {
+  paintEditSlotNumber = slotNumber;
+  paintEditIsNew = isNew;
+  setOption11PageOpen(true);
+}
+
+function handlePaintAccept(slotNumber) {
+  const sessionUserId = getStoredUser()?.id;
+  if (slotNumber && sessionUserId) {
+    profileUserMenuSelection = slotNumber;
+    saveProfileUserMenuSelection(sessionUserId, slotNumber);
+    draftProfileSlotKeys.delete(getDraftProfileSlotKey(sessionUserId, slotNumber));
+  }
+  paintEditSlotNumber = null;
+  paintEditIsNew = false;
+  setOption11PageOpen(false);
+  renderMenuContent();
+  syncProfileAvatarDisplay();
+}
+
+function handlePaintCancel(slotNumber) {
+  const sessionUserId = getStoredUser()?.id;
+  if (paintEditIsNew && sessionUserId && slotNumber && !loadCirclePaint(sessionUserId, slotNumber)) {
+    deleteProfileSlot(sessionUserId, slotNumber);
+    draftProfileSlotKeys.delete(getDraftProfileSlotKey(sessionUserId, slotNumber));
+  }
+  paintEditSlotNumber = null;
+  paintEditIsNew = false;
+  setOption11PageOpen(false);
+  renderMenuContent();
+  syncProfileAvatarDisplay();
+}
+
+function handlePaintErase() {
+  renderMenuContent();
+  syncProfileAvatarDisplay();
+}
+
+function handlePaintDelete(slotNumber) {
+  const sessionUserId = getStoredUser()?.id;
+  if (!sessionUserId || !slotNumber) return;
+
+  clearCirclePaint(sessionUserId, slotNumber);
+  if (!deleteProfileSlot(sessionUserId, slotNumber)) {
+    toast('Cannot delete the last user');
+    return;
+  }
+
+  void deleteProfileSlotVoice(sessionUserId, slotNumber);
+
+  if (profileUserMenuSelection === slotNumber) {
+    const remaining = loadProfileSlotNumbers(sessionUserId);
+    profileUserMenuSelection = remaining[0] ?? null;
+    if (profileUserMenuSelection) {
+      saveProfileUserMenuSelection(sessionUserId, profileUserMenuSelection);
+    }
+  }
+
+  paintEditSlotNumber = null;
+  paintEditIsNew = false;
+  profileUserGridOpen = true;
+  setOption11PageOpen(false);
+  renderMenuContent();
+  syncProfileAvatarDisplay();
+}
+
+function handleAddProfileUser() {
+  const sessionUserId = getStoredUser()?.id;
+  if (!sessionUserId) return;
+
+  const slotNumber = addProfileSlot(sessionUserId);
+  if (!slotNumber) {
+    toast('User limit reached');
+    return;
+  }
+
+  profileUserMenuSelection = slotNumber;
+  saveProfileUserMenuSelection(sessionUserId, slotNumber);
+  draftProfileSlotKeys.add(getDraftProfileSlotKey(sessionUserId, slotNumber));
+  profileUserGridOpen = true;
+  renderMenuContent();
+  syncProfileAvatarDisplay();
+}
+
+function setupProfileUserGrid(panel) {
+  const triggerSlot = $('#user-profile-user-trigger', panel);
+  const panelSlot = $('#user-profile-user-panel', panel);
+  if (!triggerSlot || !panelSlot) return;
+
+  triggerSlot.innerHTML = '';
+  panelSlot.innerHTML = '';
+
+  const user = getStoredUser();
+  const sessionUserId = user?.id || '';
+  if (sessionUserId && profileUserMenuSelection === null) {
+    profileUserMenuSelection = loadProfileUserMenuSelection(sessionUserId);
+  }
+  const slotNumbers = loadProfileSlotNumbers(sessionUserId);
+  if (profileUserMenuSelection && !slotNumbers.includes(profileUserMenuSelection)) {
+    profileUserMenuSelection = slotNumbers[0] ?? null;
+  }
+
+  const menuItems = buildProfileMenuItems(sessionUserId);
+
+  profileUserMenuPicker = createCollapsibleNumberedCircleGrid(triggerSlot, {
+    panelContainer: panelSlot,
+    items: menuItems,
+    value: profileUserMenuSelection,
+    open: profileUserGridOpen,
+    onOpenChange: (open) => {
+      profileUserGridOpen = open;
+    },
+    getTriggerHtml: ({ selected }) => (
+      buildProfileCollapsibleUserTriggerHtml(selected)
+    ),
+    onChange: (number) => {
+      if (recordingSession) cancelVoiceSampleRecording();
+      profileUserMenuSelection = number;
+      saveProfileUserMenuSelection(sessionUserId, number);
+      syncProfileAvatarDisplay();
+      loadVoiceLangPrefs(getStoredUser(), number);
+      void refreshVoiceProfile();
+    },
+    onOptionAction: (key) => {
+      if (key === 'add') {
+        handleAddProfileUser();
+        return true;
+      }
+      return false;
+    },
+  });
+}
+
+function setOption11PageOpen(open) {
+  option11PageOpen = open;
+  const page = $('#user-profile-option11-page', rootEl);
+  if (page) page.hidden = !open;
+  if (open) {
+    if (voiceSamplesPageOpen) setVoiceSamplesPageOpen(false);
+    profileUserMenuPicker?.close?.();
+    window.dispatchEvent(new CustomEvent('lingo:close-lang-pickers'));
+    profileCirclePaint?.syncActionButtons?.();
+    profileCirclePaint?.open();
+  } else {
+    profileCirclePaint?.close();
+    paintEditSlotNumber = null;
+    paintEditIsNew = false;
+  }
+}
+
+function setVoiceSamplesPageOpen(open) {
+  const wasOpen = voiceSamplesPageOpen;
+  voiceSamplesPageOpen = open;
+  const page = $('#user-profile-voice-samples-page', rootEl);
+  if (page) page.hidden = !open;
+  if (open) {
+    if (option11PageOpen) setOption11PageOpen(false);
+    window.dispatchEvent(new CustomEvent('lingo:close-lang-pickers'));
+    void renderVoiceSamplesPage();
+  } else if (wasOpen && recordingSession) {
+    cancelVoiceSampleRecording();
+  }
 }
 
 function nextPromptIndex(sampleCount, maxSamples = MIN_SAMPLES) {
@@ -227,10 +609,10 @@ function discardActiveRecording() {
 }
 
 function getProfileRecordingToolbar() {
-  const panel = $('#user-profile-panel', rootEl);
-  const levelEl = $('#user-voice-level', panel);
+  const page = $('#user-profile-voice-samples-page', rootEl);
+  const levelEl = $('#user-voice-level', page);
   const toolbar = levelEl?.closest('.user-profile-recording-toolbar');
-  return { panel, levelEl, toolbar };
+  return { page, levelEl, toolbar };
 }
 
 function startProfileWaveLoop() {
@@ -300,55 +682,15 @@ async function maybeEnsureVoiceConfigured() {
   }
 }
 
-function renderMenuContent() {
-  const user = getStoredUser();
-  const panel = $('#user-profile-panel', rootEl);
-  if (!panel || !user) return;
-
-  loadVoiceLangPrefs(user);
-  const ui = getVoiceUi(voiceLang);
-  const state = getProfileState(user);
-  const {
-    maxSamples,
-    sampleCount,
-    canRecordMore,
-    samplesComplete,
-  } = state;
-  const prompt = getVoicePrompt(voiceLang, nextPromptIndex(sampleCount, maxSamples));
-  const isRecording = Boolean(recordingSession);
-  const recordingAtLimit = isRecording && !canRecordMore;
-  const showRecord = canRecordMore && !isRecording && !creatingVoice && !savingSample;
-  const busy = isRecording || savingSample || creatingVoice;
-  const savedCount = Math.min(sampleCount, maxSamples);
-  const cloneLanguageList = formatCloneVoiceLanguageList(voiceLang);
-
-  panel.innerHTML = `
-    <div class="user-profile-meta-row">
-      <div class="user-profile-samples-group">
-        <div class="user-profile-samples-saved" title="${escapeHtml(ui.samplesSaved)}" aria-label="${escapeHtml(ui.samplesSaved)}: ${savedCount}/${maxSamples}">
-          ${PROFILE_SAMPLES_SAVED_ICON_SVG}
-          <span class="user-profile-samples-count">${savedCount}/${maxSamples}</span>
-        </div>
-        ${samplesComplete ? `
-        <span class="user-profile-samples-complete" title="${escapeHtml(ui.enoughSamples)}" aria-label="${escapeHtml(ui.enoughSamples)}">
-          ${PROFILE_SAMPLES_COMPLETE_SVG}
-        </span>
-        ` : savedCount > 0 ? `
-        <button
-          type="button"
-          class="user-profile-samples-reset user-profile-icon-btn"
-          id="user-profile-samples-reset"
-          title="${escapeHtml(ui.resetSamples)}"
-          aria-label="${escapeHtml(ui.resetSamples)}"
-          ${busy ? 'disabled' : ''}
-        >
-          ${PROFILE_RECORDING_CANCEL_SVG}
-        </button>
-        ` : ''}
-      </div>
-      <div class="user-profile-lang-slot user-profile-prompt-lang" id="user-profile-lang"></div>
-    </div>
-
+function buildVoiceRecordingMarkup({
+  ui,
+  prompt,
+  isRecording,
+  recordingAtLimit,
+  showRecord,
+  savingSample,
+}) {
+  return `
     ${recordingAtLimit ? `<p class="user-profile-note">${ui.recordingBlocked}</p>` : ''}
 
     ${showRecord || (isRecording && !recordingAtLimit) ? `
@@ -407,6 +749,89 @@ function renderMenuContent() {
       </div>
       ` : ''}
     </div>
+  `;
+}
+
+function bindVoiceRecordingControls(root) {
+  $('#user-voice-record-btn', root)?.addEventListener('click', () => void startVoiceSampleRecording());
+  $('#user-voice-stop-btn', root)?.addEventListener('click', () => void stopVoiceSampleRecording());
+  $('#user-voice-cancel-btn', root)?.addEventListener('click', () => cancelVoiceSampleRecording());
+}
+
+async function renderVoiceSamplesPage() {
+  const user = getStoredUser();
+  const page = $('#user-profile-voice-samples-page', rootEl);
+  const main = $('#user-profile-voice-samples-main', page);
+  if (!page || !main || !user) return;
+
+  await ensureProfileLanguages();
+  loadVoiceLangPrefs(user);
+  const ui = getVoiceUi(voiceLang);
+  const state = getProfileState(user);
+  const { maxSamples, sampleCount, canRecordMore } = state;
+  const prompt = getVoicePrompt(voiceLang, nextPromptIndex(sampleCount, maxSamples));
+  const isRecording = Boolean(recordingSession);
+  const recordingAtLimit = isRecording && !canRecordMore;
+  const showRecord = canRecordMore && !isRecording && !creatingVoice && !savingSample;
+
+  main.innerHTML = buildVoiceRecordingMarkup({
+    ui,
+    prompt,
+    isRecording,
+    recordingAtLimit,
+    showRecord,
+    savingSample,
+  });
+
+  bindVoiceRecordingControls(page);
+  setupProfileLangPicker(page, user);
+  if (isRecording) setupProfileRecordingWave();
+}
+
+async function renderMenuContent() {
+  const user = getStoredUser();
+  const panel = $('#user-profile-panel', rootEl);
+  if (!panel || !user) return;
+
+  await ensureProfileLanguages();
+  loadVoiceLangPrefs(user);
+  const ui = getVoiceUi(voiceLang);
+  const state = getProfileState(user);
+  const { maxSamples, sampleCount } = state;
+  const savedCount = Math.min(sampleCount, maxSamples);
+  const cloneLanguageList = formatCloneVoiceLanguageList(voiceLang);
+
+  panel.innerHTML = `
+    <div class="user-profile-layout">
+      <div class="user-profile-top-row user-profile-top-row--split">
+        <div class="user-profile-top-row-left">
+          <button
+            type="button"
+            class="user-profile-header-circle user-profile-samples-circle lang-bar-circle-slot"
+            id="user-profile-samples-btn"
+            title="${escapeHtml(ui.samplesSaved)}"
+            aria-label="${escapeHtml(ui.samplesSaved)}: ${savedCount}/${maxSamples}"
+          >
+            <span class="user-profile-samples-circle-count">${savedCount}/${maxSamples}</span>
+          </button>
+          <div
+            class="user-profile-user-trigger-slot lang-bar-circle-slot"
+            id="user-profile-user-trigger"
+          ></div>
+        </div>
+        <button
+          type="button"
+          class="user-profile-header-circle user-profile-edit-user-btn lang-bar-circle-slot"
+          id="user-profile-edit-user-btn"
+          title="${escapeHtml(ui.editUser)}"
+          aria-label="${escapeHtml(ui.editUser)}"
+        ></button>
+      </div>
+      <div
+        class="user-profile-user-panel-slot"
+        id="user-profile-user-panel"
+        hidden
+      ></div>
 
     <div class="user-profile-session-area">
       <div class="user-profile-session-bar">
@@ -471,12 +896,17 @@ function renderMenuContent() {
       <p class="user-profile-recovery-text" id="user-profile-recovery-text" hidden></p>
       <p class="user-profile-recovery-text user-profile-admin-seed" id="user-profile-admin-seed" hidden></p>
     </div>
+    </div>
   `;
 
-  $('#user-voice-record-btn', panel)?.addEventListener('click', () => void startVoiceSampleRecording());
-  $('#user-voice-stop-btn', panel)?.addEventListener('click', () => void stopVoiceSampleRecording());
-  $('#user-voice-cancel-btn', panel)?.addEventListener('click', () => cancelVoiceSampleRecording());
-  $('#user-profile-samples-reset', panel)?.addEventListener('click', () => void resetAllVoiceSamples());
+  $('#user-profile-samples-btn', panel)?.addEventListener('click', () => setVoiceSamplesPageOpen(true));
+  $('#user-profile-edit-user-btn', panel)?.addEventListener('click', () => {
+    const sessionUserId = getStoredUser()?.id;
+    if (!profileUserMenuSelection || !sessionUserId) return;
+    openPaintEditor(profileUserMenuSelection, {
+      isNew: isDraftProfileSlot(sessionUserId, profileUserMenuSelection),
+    });
+  });
   $('#user-profile-signout', panel)?.addEventListener('click', () => signOut());
   $('#user-profile-create-account', panel)?.addEventListener('click', () => void createAdminAccount(panel));
 
@@ -541,7 +971,11 @@ function renderMenuContent() {
     setRecoveryToggleUi(recoveryToggle, voiceLang, true);
   });
 
-  setupProfileLangPicker(panel, user);
+  setupProfileUserGrid(panel);
+  syncProfileAvatarDisplay();
+  if (voiceSamplesPageOpen) {
+    await renderVoiceSamplesPage();
+  }
 }
 
 async function createAdminAccount(panel) {
@@ -605,6 +1039,7 @@ function updateTrigger() {
   trigger.dataset.visual = visual;
 
   const name = getDisplayName(user) || 'User';
+
   const labels = {
     open: `Close ${name} profile`,
     ready: `Close ${name} profile`,
@@ -612,29 +1047,34 @@ function updateTrigger() {
   };
   trigger.title = labels[visual];
   trigger.setAttribute('aria-label', labels[visual]);
+  syncProfileAvatarDisplay();
 }
 
 function setMenuOpen(open) {
   menuOpen = open;
-  if (!open && recordingSession) cancelVoiceSampleRecording();
+  if (!open) {
+    if (recordingSession) cancelVoiceSampleRecording();
+    setOption11PageOpen(false);
+    setVoiceSamplesPageOpen(false);
+    profileUserMenuPicker?.close?.();
+    profileUserGridOpen = false;
+  }
   rootEl?.classList.toggle('is-open', open);
   const trigger = $('#user-profile-trigger', rootEl);
   const panel = $('#user-profile-panel', rootEl);
   trigger?.setAttribute('aria-expanded', open ? 'true' : 'false');
   if (panel) panel.hidden = !open;
   if (open) {
-    syncPanelPosition();
-    window.addEventListener('resize', syncPanelPosition, { passive: true });
-    window.addEventListener('scroll', syncPanelPosition, { passive: true });
-  } else {
-    window.removeEventListener('resize', syncPanelPosition);
-    window.removeEventListener('scroll', syncPanelPosition);
+    window.dispatchEvent(new CustomEvent('lingo:close-lang-pickers'));
   }
   updateTrigger();
 }
 
 async function refreshVoiceProfile() {
-  const res = await apiFetch('/api/voice/profile');
+  const slot = getCurrentProfileSlot();
+  if (!slot) return;
+
+  const res = await apiFetch(voiceApiPath('/api/voice/profile', slot));
   if (!res.ok) return;
   voiceProfile = await res.json();
 
@@ -645,23 +1085,41 @@ async function refreshVoiceProfile() {
     toast(`Extra recording discarded — you already have ${state.maxSamples} samples`);
   }
 
+  syncStoredUserVoiceState();
   renderMenuContent();
   updateTrigger();
   await maybeEnsureVoiceConfigured();
 }
 
+async function fetchCurrentUserForSlot(slot) {
+  const res = await apiFetch(voiceApiPath('/api/me', slot));
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => ({}));
+  if (!data.user) return null;
+  setStoredUser(data.user);
+  return data;
+}
+
 export async function refreshUserSession() {
-  const data = await fetchCurrentUser();
+  const user = getStoredUser();
+  const slot = getCurrentProfileSlot() ?? loadActiveProfileSlot(user?.id);
+  const data = slot ? await fetchCurrentUserForSlot(slot) : await fetchCurrentUser();
   if (data?.user) {
     setStoredUser(applyDisplayName(data.user));
+    profileUserMenuSelection = loadProfileUserMenuSelection(data.user.id) ?? slot;
     voiceProfile = data.voiceProfile ? {
       ...data.voiceProfile,
-      samples: [],
+      samples: data.voiceProfile.samples || [],
     } : null;
-    await refreshVoiceProfile();
+    syncStoredUserVoiceState();
+    if (!voiceProfile) {
+      await refreshVoiceProfile();
+    } else {
+      renderMenuContent();
+      updateTrigger();
+    }
   }
   updateTrigger();
-  renderMenuContent();
   onUserChange?.(getStoredUser());
 }
 
@@ -750,7 +1208,7 @@ async function stopVoiceSampleRecording() {
     const form = new FormData();
     form.append('audio', blob, `voice-sample.${session.mimeType.includes('mp4') ? 'mp4' : 'webm'}`);
 
-    const res = await apiFetch('/api/voice/samples', {
+    const res = await apiFetch(voiceApiPath('/api/voice/samples', getCurrentProfileSlot()), {
       method: 'POST',
       body: form,
     });
@@ -786,7 +1244,7 @@ async function resetAllVoiceSamples() {
   const ui = getVoiceUi(user?.nativeLanguage);
   if (!window.confirm(ui.confirmRecordAgain)) return;
 
-  const res = await apiFetch('/api/voice/samples', { method: 'DELETE' });
+  const res = await apiFetch(voiceApiPath('/api/voice/samples', getCurrentProfileSlot()), { method: 'DELETE' });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     toast(data.error || 'Could not reset samples');
@@ -802,7 +1260,7 @@ async function createVoiceProfile(isUpdate) {
   renderMenuContent();
 
   try {
-    const res = await apiFetch('/api/voice/create', { method: 'POST' });
+    const res = await apiFetch(voiceApiPath('/api/voice/create', getCurrentProfileSlot()), { method: 'POST' });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       toast(data.error || 'Could not create voice profile');
@@ -839,19 +1297,67 @@ function bindMenuEvents() {
     if (nextOpen) {
       await ensureProfileLanguages();
       await refreshVoiceProfile();
-      renderMenuContent();
-      syncPanelPosition();
+      await renderMenuContent();
     }
   });
 
-  panel?.addEventListener('click', (event) => {
-    event.stopPropagation();
+  panel?.addEventListener('pointerdown', (event) => {
+    if (event.target.closest(
+      'button, a, input, textarea, select, .lang-picker, .lang-picker-circle-trigger, .lang-picker-circle-option, .user-profile-header-circle, .lang-picker-collapsible-user-trigger, .user-profile-user-panel-slot, .user-profile-edit-user-btn'
+    )) {
+      return;
+    }
+    setMenuOpen(false);
+  });
+
+  document.addEventListener('pointerdown', (event) => {
+    if (menuOpen && rootEl && !rootEl.contains(event.target)) {
+      setMenuOpen(false);
+    }
   });
 
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && recordingSession) {
       cancelVoiceSampleRecording();
+      return;
     }
+    if (event.key === 'Escape' && option11PageOpen) {
+      event.stopPropagation();
+      handlePaintCancel(paintEditSlotNumber);
+      return;
+    }
+    if (event.key === 'Escape' && voiceSamplesPageOpen) {
+      event.stopPropagation();
+      setVoiceSamplesPageOpen(false);
+      return;
+    }
+    if (event.key === 'Escape' && profileUserMenuPicker?.isExpanded?.()) {
+      event.stopPropagation();
+      profileUserMenuPicker.close();
+      profileUserGridOpen = false;
+      return;
+    }
+    if (event.key === 'Escape' && menuOpen) {
+      const openInnerPanel = panel?.querySelector('.lang-picker-circle-panel:not([hidden])');
+      if (openInnerPanel) return;
+      setMenuOpen(false);
+      trigger?.focus();
+    }
+  });
+
+  const option11Page = $('#user-profile-option11-page', rootEl);
+  option11Page?.addEventListener('pointerdown', (event) => {
+    event.stopPropagation();
+  });
+
+  const voiceSamplesPage = $('#user-profile-voice-samples-page', rootEl);
+  voiceSamplesPage?.addEventListener('pointerdown', (event) => {
+    event.stopPropagation();
+  });
+
+  $('#user-profile-voice-samples-back', rootEl)?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    setVoiceSamplesPageOpen(false);
   });
 }
 
@@ -863,13 +1369,106 @@ export function initUserProfile(slotEl, { onChange, showToast } = {}) {
   rootEl.className = 'user-profile';
   rootEl.innerHTML = `
     <button type="button" class="user-profile-trigger" id="user-profile-trigger" data-visual="setup" aria-haspopup="true" aria-expanded="false">
-      ${USER_PROFILE_TRIGGER_ICON}
+      ${buildProfileCircleMarkup()}
     </button>
     <div class="user-profile-panel" id="user-profile-panel" hidden></div>
+    <div class="user-profile-option11-page" id="user-profile-option11-page" hidden>
+      <div class="user-profile-option11-main">
+        <div class="user-profile-option11-circle">
+          <canvas
+            class="user-profile-option11-canvas"
+            id="user-profile-option11-canvas"
+            aria-label="Paint circle"
+          ></canvas>
+        </div>
+        <div class="user-profile-option11-palette" id="user-profile-option11-palette"></div>
+      </div>
+      <div class="user-profile-option11-footer">
+        <div class="user-profile-option11-erase-row">
+          <div class="user-profile-option11-action">
+            <button
+              type="button"
+              class="user-profile-option11-erase"
+              id="user-profile-option11-erase"
+              aria-label="Erase painting"
+              title="Erase drawing"
+            >
+              <span class="lang-picker-circle">
+                <span class="lang-picker-circle-bg lang-picker-circle-bg--empty" aria-hidden="true"></span>
+                <span class="lang-picker-circle-label lang-picker-circle-label--symbol">⌫</span>
+              </span>
+            </button>
+            <span class="user-profile-option11-action-caption">Erase</span>
+          </div>
+          <div class="user-profile-option11-action user-profile-option11-action--delete" id="user-profile-option11-delete-wrap" hidden>
+            <button
+              type="button"
+              class="user-profile-option11-delete"
+              id="user-profile-option11-delete"
+              aria-label="Delete user"
+              title="Delete user account"
+            >
+              <span class="lang-picker-circle">
+                <span class="lang-picker-circle-bg lang-picker-circle-bg--empty" aria-hidden="true"></span>
+                <span class="lang-picker-circle-label lang-picker-circle-label--symbol user-profile-option11-delete-x">×</span>
+              </span>
+            </button>
+            <span class="user-profile-option11-action-caption user-profile-option11-action-caption--delete">Delete user</span>
+          </div>
+        </div>
+        <div class="user-profile-option11-confirm-row">
+          <button
+            type="button"
+            class="user-profile-option11-cancel"
+            id="user-profile-option11-cancel"
+            aria-label="Cancel"
+            title="Cancel"
+          >×</button>
+          <button
+            type="button"
+            class="user-profile-option11-accept"
+            id="user-profile-option11-accept"
+            aria-label="Save and close"
+            title="Save"
+          >✓</button>
+        </div>
+      </div>
+    </div>
+    <div class="user-profile-voice-samples-page" id="user-profile-voice-samples-page" hidden>
+      <button
+        type="button"
+        class="user-profile-voice-samples-back"
+        id="user-profile-voice-samples-back"
+        aria-label="Go back"
+      >←</button>
+      <div class="user-profile-voice-samples-layout">
+        <div class="user-profile-voice-samples-top">
+          <div
+            class="user-profile-lang-slot user-profile-prompt-lang lang-bar-circle-slot"
+            id="user-profile-voice-samples-lang"
+          ></div>
+        </div>
+        <div class="user-profile-voice-samples-main" id="user-profile-voice-samples-main"></div>
+      </div>
+    </div>
   `;
   slotEl.appendChild(rootEl);
 
+  profileCirclePaint = initProfileCirclePaint($('#user-profile-option11-page', rootEl), {
+    getSessionUserId: () => getStoredUser()?.id || '',
+    getSlotNumber: () => paintEditSlotNumber,
+    canDeleteSlot: (sessionUserId, slotNumber) => canDeleteProfileSlot(sessionUserId, slotNumber),
+    onAccept: (slotNumber) => handlePaintAccept(slotNumber),
+    onCancel: (slotNumber) => handlePaintCancel(slotNumber),
+    onErase: () => handlePaintErase(),
+    onDelete: (slotNumber) => handlePaintDelete(slotNumber),
+  });
+
+  const user = getStoredUser();
+  profileUserMenuSelection = loadProfileUserMenuSelection(user?.id);
+
   bindMenuEvents();
+  window.addEventListener('lingo:close-profile-menu', () => setMenuOpen(false));
   void ensureProfileLanguages();
   updateTrigger();
   renderMenuContent();

@@ -1,22 +1,36 @@
-import fs from 'fs/promises';
-import path from 'path';
-import { getVoiceDataRoot } from './data-paths.js';
+import {
+  deleteFile,
+  deletePrefix,
+  readBuffer,
+  readText,
+  writeBuffer,
+  writeText,
+} from './persistent-store.js';
 
-const DATA_ROOT = getVoiceDataRoot();
-
-function userDir(userId) {
-  return path.join(DATA_ROOT, userId);
-}
-
-function metaPath(userId) {
-  return path.join(userDir(userId), 'meta.json');
-}
-
-function samplesDir(userId) {
-  return path.join(userDir(userId), 'samples');
-}
+const MAX_PROFILE_SLOT = 20;
+const LEGACY_MIGRATION_SLOT = 1;
 
 const MAX_VOICE_SAMPLES = 6;
+
+function slotPrefix(userId, slotNumber) {
+  return `voices/${userId}/slots/${slotNumber}`;
+}
+
+function metaKey(userId, slotNumber) {
+  return `${slotPrefix(userId, slotNumber)}/meta.json`;
+}
+
+function sampleKey(userId, slotNumber, sampleId, ext) {
+  return `${slotPrefix(userId, slotNumber)}/samples/${sampleId}.${ext}`;
+}
+
+function legacyMetaKey(userId) {
+  return `voices/${userId}/meta.json`;
+}
+
+function legacySampleKey(userId, sampleId, ext) {
+  return `voices/${userId}/samples/${sampleId}.${ext}`;
+}
 
 function emptyProfile() {
   return {
@@ -27,48 +41,95 @@ function emptyProfile() {
   };
 }
 
-async function writeMeta(userId, meta) {
-  const dir = userDir(userId);
-  await fs.mkdir(dir, { recursive: true });
+export function validateProfileSlot(slotNumber) {
+  const slot = Number(slotNumber);
+  if (!Number.isInteger(slot) || slot < 1 || slot > MAX_PROFILE_SLOT) {
+    const err = new Error(`Profile slot must be an integer from 1 to ${MAX_PROFILE_SLOT}`);
+    err.code = 'INVALID_SLOT';
+    throw err;
+  }
+  return slot;
+}
+
+function parseMeta(raw) {
+  const parsed = JSON.parse(raw);
+  return {
+    ...emptyProfile(),
+    ...parsed,
+    samples: Array.isArray(parsed.samples) ? parsed.samples : [],
+  };
+}
+
+async function readMetaFile(key) {
+  const raw = await readText(key);
+  if (!raw) return null;
+  return parseMeta(raw);
+}
+
+async function migrateLegacyProfile(userId) {
+  const legacyMeta = await readMetaFile(legacyMetaKey(userId));
+  if (!legacyMeta) return false;
+
+  const profile = { ...legacyMeta };
+  const slot = LEGACY_MIGRATION_SLOT;
+
+  for (const sample of profile.samples) {
+    const source = await readBuffer(legacySampleKey(userId, sample.id, sample.ext));
+    if (source) {
+      await writeBuffer(sampleKey(userId, slot, sample.id, sample.ext), source, sample.mimeType || 'audio/webm');
+    }
+  }
+
+  profile.updatedAt = Date.now();
+  await writeText(metaKey(userId, slot), JSON.stringify(profile, null, 2));
+  await deletePrefix(`voices/${userId}/samples`);
+  await deleteFile(legacyMetaKey(userId));
+  return true;
+}
+
+async function writeMeta(userId, slotNumber, meta) {
   meta.updatedAt = Date.now();
-  await fs.writeFile(metaPath(userId), JSON.stringify(meta, null, 2));
+  await writeText(metaKey(userId, slotNumber), JSON.stringify(meta, null, 2));
 }
 
 export { MAX_VOICE_SAMPLES };
 
-export async function getVoiceProfile(userId) {
-  try {
-    const raw = await fs.readFile(metaPath(userId), 'utf8');
-    const parsed = JSON.parse(raw);
-    return {
-      ...emptyProfile(),
-      ...parsed,
-      samples: Array.isArray(parsed.samples) ? parsed.samples : [],
-    };
-  } catch {
-    return emptyProfile();
+export async function getVoiceProfile(userId, slotNumber) {
+  const slot = validateProfileSlot(slotNumber);
+  const key = metaKey(userId, slot);
+
+  let profile = await readMetaFile(key);
+  if (profile) return profile;
+
+  if (slot === LEGACY_MIGRATION_SLOT) {
+    const migrated = await migrateLegacyProfile(userId);
+    if (migrated) {
+      profile = await readMetaFile(key);
+      if (profile) return profile;
+    }
   }
+
+  return emptyProfile();
 }
 
-export async function listVoiceSampleBuffers(userId) {
-  const profile = await getVoiceProfile(userId);
+export async function listVoiceSampleBuffers(userId, slotNumber) {
+  const slot = validateProfileSlot(slotNumber);
+  const profile = await getVoiceProfile(userId, slot);
   const buffers = [];
 
   for (const sample of profile.samples) {
-    const filePath = path.join(samplesDir(userId), `${sample.id}.${sample.ext}`);
-    try {
-      const buffer = await fs.readFile(filePath);
+    const buffer = await readBuffer(sampleKey(userId, slot, sample.id, sample.ext));
+    if (buffer) {
       buffers.push({ id: sample.id, buffer, ext: sample.ext, mimeType: sample.mimeType || 'audio/webm' });
-    } catch {
-      // skip missing files
     }
   }
 
   return { profile, buffers };
 }
 
-export async function addVoiceSample(userId, buffer, mimeType = 'audio/webm') {
-  const profile = await getVoiceProfile(userId);
+export async function addVoiceSample(userId, slotNumber, buffer, mimeType = 'audio/webm') {
+  const slot = validateProfileSlot(slotNumber);
+  const profile = await getVoiceProfile(userId, slot);
   if (profile.samples.length >= MAX_VOICE_SAMPLES) {
     const err = new Error(`You already have ${MAX_VOICE_SAMPLES} samples`);
     err.code = 'SAMPLE_LIMIT';
@@ -77,8 +138,7 @@ export async function addVoiceSample(userId, buffer, mimeType = 'audio/webm') {
   const ext = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('ogg') ? 'ogg' : 'webm';
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  await fs.mkdir(samplesDir(userId), { recursive: true });
-  await fs.writeFile(path.join(samplesDir(userId), `${id}.${ext}`), buffer);
+  await writeBuffer(sampleKey(userId, slot, id, ext), buffer, mimeType);
 
   profile.samples.push({
     id,
@@ -88,22 +148,18 @@ export async function addVoiceSample(userId, buffer, mimeType = 'audio/webm') {
   });
   profile.status = profile.elevenlabsVoiceId ? 'needs_update' : 'collecting';
 
-  await writeMeta(userId, profile);
+  await writeMeta(userId, slot, profile);
   return profile;
 }
 
-export async function deleteVoiceSample(userId, sampleId) {
-  const profile = await getVoiceProfile(userId);
+export async function deleteVoiceSample(userId, slotNumber, sampleId) {
+  const slot = validateProfileSlot(slotNumber);
+  const profile = await getVoiceProfile(userId, slot);
   const sample = profile.samples.find((entry) => entry.id === sampleId);
   if (!sample) return null;
 
   profile.samples = profile.samples.filter((entry) => entry.id !== sampleId);
-
-  try {
-    await fs.unlink(path.join(samplesDir(userId), `${sample.id}.${sample.ext}`));
-  } catch {
-    // ignore missing file
-  }
+  await deleteFile(sampleKey(userId, slot, sample.id, sample.ext));
 
   if (!profile.samples.length) {
     profile.status = profile.elevenlabsVoiceId ? 'needs_update' : 'none';
@@ -113,44 +169,61 @@ export async function deleteVoiceSample(userId, sampleId) {
     profile.status = 'needs_update';
   }
 
-  await writeMeta(userId, profile);
+  await writeMeta(userId, slot, profile);
   return profile;
 }
 
-export async function clearAllVoiceSamples(userId) {
-  const profile = await getVoiceProfile(userId);
+export async function clearAllVoiceSamples(userId, slotNumber) {
+  const slot = validateProfileSlot(slotNumber);
+  const profile = await getVoiceProfile(userId, slot);
 
   for (const sample of profile.samples) {
-    try {
-      await fs.unlink(path.join(samplesDir(userId), `${sample.id}.${sample.ext}`));
-    } catch {
-      // ignore missing file
-    }
+    await deleteFile(sampleKey(userId, slot, sample.id, sample.ext));
   }
 
   profile.samples = [];
   profile.elevenlabsVoiceId = null;
   profile.status = 'none';
-  await writeMeta(userId, profile);
+  await writeMeta(userId, slot, profile);
   return profile;
 }
 
-export async function saveVoiceClone(userId, elevenlabsVoiceId) {
-  const profile = await getVoiceProfile(userId);
+export async function deleteVoiceProfileSlot(userId, slotNumber) {
+  const slot = validateProfileSlot(slotNumber);
+  await deletePrefix(`${slotPrefix(userId, slot)}/`);
+  return emptyProfile();
+}
+
+export async function saveVoiceClone(userId, slotNumber, elevenlabsVoiceId) {
+  const slot = validateProfileSlot(slotNumber);
+  const profile = await getVoiceProfile(userId, slot);
   profile.elevenlabsVoiceId = elevenlabsVoiceId;
   profile.status = 'ready';
-  await writeMeta(userId, profile);
+  await writeMeta(userId, slot, profile);
   return profile;
 }
 
-export async function clearVoiceClone(userId) {
-  const profile = await getVoiceProfile(userId);
+export async function clearVoiceClone(userId, slotNumber) {
+  const slot = validateProfileSlot(slotNumber);
+  const profile = await getVoiceProfile(userId, slot);
   profile.elevenlabsVoiceId = null;
   profile.status = profile.samples.length ? 'collecting' : 'none';
-  await writeMeta(userId, profile);
+  await writeMeta(userId, slot, profile);
   return profile;
 }
 
 export function resolveVoiceId(user, voiceProfile) {
   return voiceProfile?.elevenlabsVoiceId || user?.elevenlabsVoiceId || null;
+}
+
+export function voiceProfileSummary(voiceProfile) {
+  return {
+    status: voiceProfile.status,
+    sampleCount: voiceProfile.samples.length,
+    voiceReady: Boolean(voiceProfile.elevenlabsVoiceId),
+    elevenlabsConfigured: true,
+    minSamples: MAX_VOICE_SAMPLES,
+    maxSamples: MAX_VOICE_SAMPLES,
+    canRecordMore: voiceProfile.samples.length < MAX_VOICE_SAMPLES,
+  };
 }

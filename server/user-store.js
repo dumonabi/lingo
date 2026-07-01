@@ -1,25 +1,17 @@
-import fs from 'fs/promises';
-import path from 'path';
-import { getUserRegistryPath } from './data-paths.js';
+import { readText, writeText } from './persistent-store.js';
 
-const REGISTRY_PATH = getUserRegistryPath();
+const REGISTRY_KEY = 'users/registry.json';
 
 let cachedUsers = null;
 let loadPromise = null;
 
-async function ensureRegistryFile() {
-  await fs.mkdir(path.dirname(REGISTRY_PATH), { recursive: true });
-  try {
-    await fs.access(REGISTRY_PATH);
-  } catch {
-    await fs.writeFile(REGISTRY_PATH, '[]\n', 'utf8');
+async function loadFromStore() {
+  const raw = await readText(REGISTRY_KEY);
+  if (!raw) {
+    cachedUsers = [];
+    return cachedUsers;
   }
-}
-
-async function loadFromDisk() {
-  await ensureRegistryFile();
   try {
-    const raw = await fs.readFile(REGISTRY_PATH, 'utf8');
     const parsed = JSON.parse(raw);
     cachedUsers = Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -30,7 +22,7 @@ async function loadFromDisk() {
 
 export async function ensureUserRegistryLoaded() {
   if (cachedUsers) return cachedUsers;
-  if (!loadPromise) loadPromise = loadFromDisk();
+  if (!loadPromise) loadPromise = loadFromStore();
   return loadPromise;
 }
 
@@ -45,8 +37,7 @@ export async function readUserRegistry() {
 
 async function persistUsers(users) {
   cachedUsers = users;
-  await ensureRegistryFile();
-  await fs.writeFile(REGISTRY_PATH, `${JSON.stringify(users, null, 2)}\n`, 'utf8');
+  await writeText(REGISTRY_KEY, `${JSON.stringify(users, null, 2)}\n`);
 }
 
 export async function findStoredUserById(id) {
