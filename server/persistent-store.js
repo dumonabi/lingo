@@ -14,7 +14,7 @@ async function readBlobText(key) {
   const { get, BlobNotFoundError } = await import('@vercel/blob');
   try {
     const result = await get(key, { access: 'private' });
-    if (result.statusCode !== 200 || !result.stream) return null;
+    if (!result || result.statusCode !== 200 || !result.stream) return null;
     return await new Response(result.stream).text();
   } catch (err) {
     if (err?.name === 'BlobNotFoundError' || err?.constructor?.name === 'BlobNotFoundError') {
@@ -28,7 +28,7 @@ async function readBlobBuffer(key) {
   const { get } = await import('@vercel/blob');
   try {
     const result = await get(key, { access: 'private' });
-    if (result.statusCode !== 200 || !result.stream) return null;
+    if (!result || result.statusCode !== 200 || !result.stream) return null;
     return Buffer.from(await new Response(result.stream).arrayBuffer());
   } catch (err) {
     if (err?.name === 'BlobNotFoundError' || err?.constructor?.name === 'BlobNotFoundError') {
